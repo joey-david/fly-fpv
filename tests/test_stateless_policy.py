@@ -5,7 +5,7 @@ import pandas as pd
 import scipy.sparse as sp
 import torch
 
-from flypv.connectome.circuits import FlightCircuit
+from flypv.connectome.circuits import FlightCircuit, MOTOR_GROUPS
 from flypv.connectome.loader import Connectome
 from flypv.policy.connectome_policy import ConnectomePolicy, PolicyConfig
 from flypv.train.config import TrainConfig
@@ -13,7 +13,6 @@ from flypv.train.config import TrainConfig
 
 class StatelessPolicyTests(unittest.TestCase):
     def _policy(self):
-        # 0 -> 1 -> 2, with one sensory input and one power output.
         W = sp.csr_matrix(
             (np.array([8.0, 8.0], dtype=np.float32),
              (np.array([1, 2]), np.array([0, 1]))),
@@ -25,16 +24,16 @@ class StatelessPolicyTests(unittest.TestCase):
             "somaSide": ["R", "R", "R"],
         })
         cx = Connectome(
-            body_ids=np.arange(3, dtype=np.int64),
-            W=W,
-            meta=meta,
+            body_ids=np.arange(3, dtype=np.int64), W=W, meta=meta,
             nt_sign=np.ones(3, dtype=np.float32),
         )
         circuit = FlightCircuit(
             cx=cx,
             afferent={"retina": np.array([], dtype=np.int64),
                       "haltere": np.array([0], dtype=np.int64)},
-            efferent={"power": np.array([2], dtype=np.int64)},
+            # Keep every decoder group present so the critic fixture has the
+            # same pooled-feature width as a real flight circuit.
+            efferent={k: np.array([2], dtype=np.int64) for k in MOTOR_GROUPS},
             intrinsic=np.array([1], dtype=np.int64),
             hex_coords={},
         )
