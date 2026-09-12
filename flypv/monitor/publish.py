@@ -9,6 +9,7 @@ import torch
 from .bus import BUS
 
 _TRAIL: list = []
+_LAST_POS: np.ndarray | None = None
 _DISPLAY: np.ndarray | None = None
 
 
@@ -130,6 +131,17 @@ def publish_static(circuit, env, policy, cfg):
     BUS.set_static("eye", dict(x=hx.tolist(), y=hy.tolist(), side=hside.tolist(), n=len(columns)))
 
     m = env.m
+    eye_cfg = env.eye.cfg if env.eye is not None else None
+    eye_fov = None
+    if eye_cfg is not None:
+        inward, rear = eye_cfg.fov_azimuth
+        eye_fov = dict(
+            azimuth_deg=[float(inward), float(rear)],
+            elevation_deg=[float(eye_cfg.fov_elevation[0]), float(eye_cfg.fov_elevation[1])],
+            overlap_deg=float(max(0.0, -2.0 * inward)),
+            rear_blind_deg=float(max(0.0, 360.0 - 2.0 * rear)),
+            acceptance_deg=float(eye_cfg.acceptance_angle),
+        )
     BUS.set_static(
         "info",
         dict(
@@ -146,6 +158,7 @@ def publish_static(circuit, env, policy, cfg):
             tbptt_steps=int(cfg.tbptt_steps),
             control_hz=float(env.cfg.control_hz),
             state_carry=float(cfg.state_carry),
+            eye_fov=eye_fov,
             morphology=dict(
                 wing_length=float(m.wing_length),
                 mean_chord=float(m.mean_chord),
@@ -160,60 +173,72 @@ def publish_static(circuit, env, policy, cfg):
     )
 
 
+def _episode_reset(info: dict, pos: np.ndarray) -> bool:
+    """Detect the autoreset that already happened inside env.step()."""
+    global _LAST_POS
+    reset = False
+    for key in ("crashed", "finished"):
+        value = info.get(key)
+        if value is not None and len(value) and bool(value[0]):
+            reset = True
+    # Time-limit resets do not have a dedicated flag in info. A jump back to the
+    # course start is unambiguous at this scale and catches that case too.
+    if _LAST_POS is not None and np.linalg.norm(pos - _LAST_POS) > 0.12:
+        reset = True
+    _LAST_POS = pos.copy()
+    return reset
+
+
 def publish_frame(env, policy, circuit, state: torch.Tensor, info: dict):
-    """Publish one live frame without blocking training."""
+    """Publish one monitor sample without making the dashboard do redundant work."""
     global _TRAIL
     idx = display_index(circuit)
 
+    h = None
     if state.ndim == 2 and state.numel():
         h = state[:, 0].detach().cpu().numpy()
         activity = h[idx]
         hi = float(np.percentile(activity, 99.5)) or 1.0
-        BUS.publish("act", dict(data=_quant(activity, 0.0, max(hi, 1e-3)), hi=hi))
-        BUS.publish(
-            "pools",
-            dict(
+        BUS.publish_many(
+            act=dict(data=_quant(activity, 0.0, max(hi, 1e-3)), hi=hi),
+            pools=dict(
                 motor={k: float(h[v].mean()) for k, v in circuit.efferent.items() if len(v)},
                 sensory={k: float(h[v].mean()) for k, v in circuit.afferent.items() if len(v)},
             ),
         )
 
     snap = env.snapshot(0)
+    # Luminance is sent once in the compact eye_frame channel below; do not
+    # duplicate the full column vector inside the flight payload.
+    snap.pop("luminance", None)
     ws = env.wpg.kinematics()
     snap["wing"].update(
         stroke_tilt=float(ws.stroke_tilt[0]),
         head=ws.head[0].tolist(),
         abdomen=float(ws.abdomen[0]),
     )
+
+    pos = np.asarray(snap["pos"], dtype=np.float64)
+    reset = _episode_reset(info, pos)
+    if reset:
+        _TRAIL = []
     _TRAIL.append(snap["pos"])
-    if len(_TRAIL) > 900:
-        _TRAIL = _TRAIL[-900:]
-    if (
-        snap["next_gate"] == 0
-        and len(_TRAIL) > 2
-        and np.linalg.norm(np.array(_TRAIL[-1]) - np.array(_TRAIL[-2])) > 0.05
-    ):
-        _TRAIL = _TRAIL[-1:]
+    if len(_TRAIL) > 360:
+        _TRAIL = _TRAIL[-360:]
     snap["trail"] = [[round(c, 4) for c in p] for p in _TRAIL[::2]]
-    BUS.publish("flight", snap)
+    snap["reset"] = reset
 
+    channels = {"flight": snap}
     if env.n_columns:
-        BUS.publish(
-            "eye_frame",
-            dict(
-                lum=_quant(env.last_lum[0]),
-                on=_quant(env.last_on[0]),
-                off=_quant(env.last_off[0]),
-            ),
-        )
-
-    BUS.publish(
-        "live",
-        dict(
-            speed=float(info["speed"][0]) if "speed" in info else 0.0,
-            power_rel=float(info["power_rel"][0]) if "power_rel" in info else 0.0,
-            gates_done=int(info["gates_done"][0]) if "gates_done" in info else 0,
-            upright=float(info["upright"][0]) if "upright" in info else 0.0,
-            spin=float(info["spin"][0]) if "spin" in info else 0.0,
-        ),
+        # The dashboard is an observer, not another preprocessing stage. Only
+        # show the raw luminance actually rendered at each ommatidium; ON/OFF
+        # channels remain part of the policy input but are not visualized.
+        channels["eye_frame"] = dict(lum=_quant(env.last_lum[0]))
+    channels["live"] = dict(
+        speed=float(info["speed"][0]) if "speed" in info else 0.0,
+        power_rel=float(info["power_rel"][0]) if "power_rel" in info else 0.0,
+        gates_done=int(info["gates_done"][0]) if "gates_done" in info else 0,
+        upright=float(info["upright"][0]) if "upright" in info else 0.0,
+        spin=float(info["spin"][0]) if "spin" in info else 0.0,
     )
+    BUS.publish_many(**channels)
