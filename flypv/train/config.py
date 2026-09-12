@@ -35,10 +35,13 @@ class TrainConfig:
     n_iters: int = 4
     learn_synapses: bool = False
     warmstart_steps: int = 400
+    input_norm_power: float = 0.5
 
     # architecture / task
     arch: str = "connectome"  # connectome | shuffled | erdos | mlp
     scale: str = "flight"  # full | flight | core
+    circuit_hops: int = 3
+    recurrent_closure_hops: int = 1
     max_neurons: int | None = None
     curriculum: bool = True
     curriculum_target: float = 0.72
@@ -53,10 +56,10 @@ class TrainConfig:
     run_name: str = "flypv"
     out_dir: str = "runs"
     monitor: bool = True
-    save_every: int = 20  # PPO updates; 0 disables periodic checkpoints
+    save_every: int = 20
     keep_checkpoints: int = 5
     best_metric: str = "ep_gates"
-    resume: str | None = None  # path, "latest", or "best"
+    resume: str | None = None
     reset_optimizer: bool = False
 
     env: EnvConfig = field(default_factory=EnvConfig)
@@ -82,6 +85,14 @@ class TrainConfig:
             raise ValueError("state_carry must be in [0, 1]")
         if self.n_iters < 1:
             raise ValueError("n_iters must be >= 1")
+        if not 0.0 <= self.input_norm_power <= 1.0:
+            raise ValueError("input_norm_power must be in [0, 1]")
+        if self.circuit_hops < 1:
+            raise ValueError("circuit_hops must be >= 1")
+        if self.recurrent_closure_hops < 0:
+            raise ValueError("recurrent_closure_hops must be >= 0")
+        if self.max_neurons is not None and self.max_neurons < 1:
+            raise ValueError("max_neurons must be >= 1")
         if not 0.0 <= self.curriculum_target <= 1.0:
             raise ValueError("curriculum_target must be in [0, 1]")
         if self.curriculum_rate <= 0:
@@ -108,8 +119,6 @@ class TrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> "TrainConfig":
         if not isinstance(data, dict):
             raise TypeError("training config must be a mapping")
-        # Legacy v0.1 checkpoints carried this unused field. Ignore it so old
-        # policy snapshots can still be imported as warm resume points.
         data = dict(data)
         data.pop("monitor_every", None)
         known = {f.name for f in fields(cls)}
