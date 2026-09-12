@@ -43,6 +43,9 @@ class TrainConfig:
     curriculum: bool = True
     curriculum_target: float = 0.72
     curriculum_rate: float = 0.02
+    curriculum_crash_target: float = 0.30
+    curriculum_speed_window: int = 12
+    curriculum_speed_tol: float = 0.02
 
     # run management
     device: str = "auto"
@@ -79,6 +82,16 @@ class TrainConfig:
             raise ValueError("state_carry must be in [0, 1]")
         if self.n_iters < 1:
             raise ValueError("n_iters must be >= 1")
+        if not 0.0 <= self.curriculum_target <= 1.0:
+            raise ValueError("curriculum_target must be in [0, 1]")
+        if self.curriculum_rate <= 0:
+            raise ValueError("curriculum_rate must be > 0")
+        if not 0.0 <= self.curriculum_crash_target <= 1.0:
+            raise ValueError("curriculum_crash_target must be in [0, 1]")
+        if self.curriculum_speed_window < 4:
+            raise ValueError("curriculum_speed_window must be >= 4")
+        if self.curriculum_speed_tol < 0:
+            raise ValueError("curriculum_speed_tol must be >= 0")
         if self.save_every < 0 or self.keep_checkpoints < 1:
             raise ValueError("save_every must be >= 0 and keep_checkpoints >= 1")
         if self.arch not in {"connectome", "shuffled", "erdos", "mlp"}:
