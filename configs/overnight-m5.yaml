@@ -1,0 +1,62 @@
+# Long unattended recurrent-connectome run for a 16 GB Apple-silicon laptop.
+# 100M transitions is intentionally far beyond a normal overnight run: stop it
+# in the morning with Ctrl-C and the trainer will checkpoint before exiting.
+
+total_steps: 100000000
+rollout: 128
+n_envs: 16
+epochs: 4
+minibatches: 8
+lr: 0.0001
+gamma: 0.999
+gae_lambda: 0.95
+clip: 0.2
+vf_coef: 0.5
+ent_coef: 0.004
+max_grad_norm: 0.75
+target_kl: 0.03
+
+recurrent: true
+tbptt_steps: 16
+state_carry: 1.0
+n_iters: 4
+learn_synapses: false
+warmstart_steps: 400
+
+arch: connectome
+scale: flight
+
+# Difficulty never decreases. A level advances only after the recent policy:
+#   - clears >=92% of gates,
+#   - crashes <=20% of episodes, and
+#   - gains <=1.5% speed across a 16-update window.
+# Every promotion regenerates the course pool at the new geometry.
+curriculum: true
+curriculum_target: 0.92
+curriculum_rate: 0.04
+curriculum_crash_target: 0.20
+curriculum_speed_window: 16
+curriculum_speed_tol: 0.015
+
+device: auto
+seed: 0
+run_name: overnight-m5-s0
+out_dir: runs
+monitor: true
+save_every: 10
+keep_checkpoints: 16
+best_metric: ep_gates
+
+env:
+  n_gates: 8
+  difficulty: 0.05
+  episode_seconds: 6.0
+  vision: true
+  gate_spec:
+    r_in: 0.10
+    r_in_min: 0.025
+    ring_thickness: 0.02
+    spacing: [0.46, 0.66]
+    turn: 0.9
+    climb: 0.45
+    altitude: [0.10, 0.75]
