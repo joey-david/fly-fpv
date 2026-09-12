@@ -35,13 +35,10 @@ class TrainConfig:
     n_iters: int = 4
     learn_synapses: bool = False
     warmstart_steps: int = 400
-    input_norm_power: float = 0.5
 
     # architecture / task
     arch: str = "connectome"  # connectome | shuffled | erdos | mlp
     scale: str = "flight"  # full | flight | core
-    circuit_hops: int = 3
-    recurrent_closure_hops: int = 1
     max_neurons: int | None = None
     curriculum: bool = True
     curriculum_target: float = 0.72
@@ -85,12 +82,6 @@ class TrainConfig:
             raise ValueError("state_carry must be in [0, 1]")
         if self.n_iters < 1:
             raise ValueError("n_iters must be >= 1")
-        if not 0.0 <= self.input_norm_power <= 1.0:
-            raise ValueError("input_norm_power must be in [0, 1]")
-        if self.circuit_hops < 1:
-            raise ValueError("circuit_hops must be >= 1")
-        if self.recurrent_closure_hops < 0:
-            raise ValueError("recurrent_closure_hops must be >= 0")
         if self.max_neurons is not None and self.max_neurons < 1:
             raise ValueError("max_neurons must be >= 1")
         if not 0.0 <= self.curriculum_target <= 1.0:
