@@ -1,10 +1,10 @@
-"""The measured MaleCNS wiring diagram used as a recurrent policy network.
+"""Sparse connectome-constrained policy network.
 
-Connectivity remains fixed. Training tunes neuron intrinsic properties and the
-small sensor/motor interfaces, while activity propagates through measured sparse
-edges. Synapse counts are softly normalised: a typical neuron receives unit
-aggregate drive, but unusually strong anatomical convergence is no longer erased
-entirely as it was by strict row normalisation.
+The MaleCNS graph is used as a fixed sparse architecture, not as a claim about
+real-time fly neural dynamics. Every control decision starts from zero activity,
+encodes the current observation onto sensory populations, runs a small number of
+message-passing iterations through the measured graph, and decodes motor-neuron
+activity into flight controls.
 """
 from __future__ import annotations
 
@@ -19,29 +19,16 @@ import torch.nn.functional as F
 
 from ..connectome.circuits import FlightCircuit, MOTOR_GROUPS
 
-# Indices into HoopRaceEnv.PROPRIO_DIM. Navigation/gate geometry deliberately
-# appears nowhere here: the actor can discover the course through vision, rather
-# than leaking privileged gate coordinates through every mechanosensory neuron.
-SENSOR_FEATURES: dict[str, tuple[int, ...]] = {
-    "haltere": (0, 1, 2, 9, 10),                    # body rate + wing phase
-    "johnston": (6, 7, 8),                          # body-frame airspeed
-    "wing_cs": tuple(range(9, 23)),                  # phase + prior wing controls
-    "hairplate": (3, 4, 5, 23, 24),                 # gravity/head orientation proxy
-    "chordotonal": tuple(range(9, 26)),              # phase + previous body controls
-}
-
 
 @dataclass
 class PolicyConfig:
     n_iters: int = 4
-    carry: float = 0.5
     learn_synapses: bool = False
     neuron_descriptors: int = 0
     act: str = "softplus"
     value_hidden: int = 256
     log_std_init: float = -1.6
-    sensory_hidden: int = 32
-    input_norm_power: float = 0.5  # 1=strict row norm, 0=retain relative convergence
+    sensory_hidden: int = 64
 
 
 def squashed_log_prob(dist, raw: torch.Tensor) -> torch.Tensor:
@@ -56,28 +43,6 @@ def _act(name: str):
             "elu": F.elu}[name]
 
 
-def _soft_row_normalize(W: sp.csr_matrix, power: float) -> sp.csr_matrix:
-    """Stabilise sparse drive without deleting anatomical convergence strength.
-
-    ``power=1`` reproduces strict row normalisation. At the default 0.5, total
-    input magnitude scales with sqrt(total synapse count / median), clipped to a
-    conservative [0.25, 4] envelope. Relative synapse weights within each row are
-    always preserved.
-    """
-    if not 0.0 <= power <= 1.0:
-        raise ValueError("input_norm_power must be in [0, 1]")
-    row_abs = np.asarray(np.abs(W).sum(axis=1)).ravel().astype(np.float64)
-    nz = row_abs > 0
-    if not nz.any():
-        return W.copy()
-    ref = float(np.median(row_abs[nz]))
-    target = np.ones_like(row_abs)
-    target[nz] = np.clip((row_abs[nz] / max(ref, 1.0)) ** (1.0 - power), 0.25, 4.0)
-    scale = np.zeros_like(row_abs)
-    scale[nz] = target[nz] / row_abs[nz]
-    return (sp.diags(scale.astype(np.float32)) @ W).tocsr()
-
-
 class ConnectomePolicy(nn.Module):
     def __init__(self, circuit: FlightCircuit, proprio_dim: int, action_dim: int,
                  cfg: PolicyConfig | None = None, device: str = "cpu"):
@@ -89,7 +54,12 @@ class ConnectomePolicy(nn.Module):
         self.phi = _act(self.cfg.act)
 
         W = circuit.cx.W.tocsr().astype(np.float32)
-        Wn = _soft_row_normalize(W, self.cfg.input_norm_power).tocoo()
+        # Normalize aggregate input for stability while preserving the measured
+        # relative synapse strengths into each neuron.
+        row_abs = np.asarray(np.abs(W).sum(axis=1)).ravel()
+        scale = 1.0 / np.maximum(row_abs, 1.0)
+        Wn = (sp.diags(scale.astype(np.float32)) @ W).tocoo()
+
         order = np.lexsort((Wn.col, Wn.row))
         idx = torch.from_numpy(np.stack([Wn.row[order], Wn.col[order]]).astype(np.int64))
         val = torch.from_numpy(Wn.data[order].astype(np.float32))
@@ -97,10 +67,8 @@ class ConnectomePolicy(nn.Module):
         self.register_buffer("w_val", val)
         self.n_edges = val.numel()
 
-        if self.cfg.learn_synapses:
-            self.edge_gain = nn.Parameter(torch.zeros(self.n_edges))
-        else:
-            self.edge_gain = None
+        self.edge_gain = (nn.Parameter(torch.zeros(self.n_edges))
+                          if self.cfg.learn_synapses else None)
 
         unknown = torch.from_numpy((circuit.cx.nt_sign == 0).astype(np.float32))
         self.register_buffer("sign_unknown", unknown)
@@ -110,9 +78,11 @@ class ConnectomePolicy(nn.Module):
             with torch.no_grad():
                 self.w_val[torch.from_numpy(u)] = self.w_val[torch.from_numpy(u)].abs()
 
+        # Trainable node-wise transforms. `mix_logit` controls how aggressively
+        # each message-passing iteration updates a node within this one decision.
         self.gain = nn.Parameter(torch.ones(self.N))
         self.bias = nn.Parameter(torch.zeros(self.N))
-        self.leak_logit = nn.Parameter(torch.zeros(self.N))
+        self.mix_logit = nn.Parameter(torch.zeros(self.N))
 
         if self.cfg.neuron_descriptors:
             D = self.cfg.neuron_descriptors
@@ -122,10 +92,9 @@ class ConnectomePolicy(nn.Module):
         else:
             self.eta = None
 
-        # ---- sensory ports -------------------------------------------------
+        # Vision is placed on its retinotopic connectome populations.
         self.retina_rows = torch.from_numpy(circuit.afferent.get("retina", np.array([], np.int64)))
         self.register_buffer("_ret", self.retina_rows)
-
         from ..env.vision import ON_TYPES
         col_of, on_of = [], []
         cols = sorted({(h1, h2, sd) for (h1, h2, sd) in circuit.hex_coords.values()})
@@ -140,34 +109,21 @@ class ConnectomePolicy(nn.Module):
         self.n_columns = len(cols)
         self.retina_gain = nn.Parameter(torch.tensor(1.0))
 
-        # Each real sensory population receives only the physical variables its
-        # modality can plausibly measure. This is both smaller than the previous
-        # all-proprio MLP and prevents next-gate coordinates leaking into the actor.
-        self.sensory_encoders = nn.ModuleDict()
-        for name, feat in SENSOR_FEATURES.items():
-            rows_np = circuit.afferent.get(name, np.array([], dtype=np.int64))
-            if not len(rows_np):
-                continue
-            if max(feat) >= proprio_dim:
-                raise ValueError(f"sensor feature map for {name} exceeds proprio_dim={proprio_dim}")
-            rows = torch.from_numpy(rows_np)
-            features = torch.tensor(feat, dtype=torch.long)
-            self.register_buffer(f"sensor_rows_{name}", rows)
-            self.register_buffer(f"sensor_feat_{name}", features)
-            hidden = min(self.cfg.sensory_hidden, max(8, 2 * len(feat)))
-            encoder = nn.Sequential(
-                nn.Linear(len(feat), hidden), nn.SiLU(), nn.Linear(hidden, len(rows_np))
-            )
-            nn.init.zeros_(encoder[-1].bias)
-            nn.init.normal_(encoder[-1].weight, std=0.05)
-            self.sensory_encoders[name] = encoder
+        # For flight performance rather than biological interpretation, the full
+        # low-dimensional task/proprio vector is encoded into the nonvisual
+        # afferents. This includes course geometry already present in the env obs.
+        other = [v for k, v in circuit.afferent.items() if k != "retina" and len(v)]
+        other_rows = np.concatenate(other) if other else np.array([], np.int64)
+        self.register_buffer("_oth", torch.from_numpy(other_rows))
+        h = self.cfg.sensory_hidden
+        self.sensory_encoder = nn.Sequential(
+            nn.Linear(proprio_dim, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU())
+        self.sensory_to_neurons = nn.Linear(h, max(len(other_rows), 1))
+        nn.init.zeros_(self.sensory_to_neurons.bias)
+        nn.init.normal_(self.sensory_to_neurons.weight, std=0.05)
 
-        # ---- motor readout --------------------------------------------------
         self.motor = MotorDecoder(circuit, action_dim)
         self.log_std = nn.Parameter(torch.full((action_dim,), self.cfg.log_std_init))
-
-        # The critic may use privileged task geometry to reduce variance; the
-        # policy actor cannot access it except through the biological sensors.
         self.value = nn.Sequential(
             nn.Linear(proprio_dim + 2 * len(MOTOR_GROUPS), self.cfg.value_hidden), nn.SiLU(),
             nn.Linear(self.cfg.value_hidden, self.cfg.value_hidden), nn.SiLU(),
@@ -180,20 +136,22 @@ class ConnectomePolicy(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def init_state(self, batch: int) -> torch.Tensor:
+        """Compatibility helper for monitor/warm-start callers; state is not carried."""
         return torch.zeros(self.N, batch, device=self.device)
 
     def _W(self) -> torch.Tensor:
         val = self.w_val
         if self.edge_gain is not None:
             val = val * torch.exp(self.edge_gain.clamp(-2.0, 2.0))
-        return torch.sparse_coo_tensor(self.w_idx, val, (self.N, self.N),
-                                       is_coalesced=True)
+        return torch.sparse_coo_tensor(
+            self.w_idx, val, (self.N, self.N), is_coalesced=True, check_invariants=False
+        )
 
     def presyn_sign(self) -> torch.Tensor:
         return (1.0 - self.sign_unknown
                 + self.sign_unknown * torch.tanh(self.sign_logit)).unsqueeze(1)
 
-    def forward(self, obs: dict, state: torch.Tensor):
+    def forward(self, obs: dict, state: torch.Tensor | None = None):
         proprio = obs["proprio"]
         B = proprio.shape[0]
         drive = torch.zeros(self.N, B, device=proprio.device)
@@ -204,16 +162,16 @@ class ConnectomePolicy(nn.Module):
             rd = self.ret_is_on.unsqueeze(1) * on + (1 - self.ret_is_on).unsqueeze(1) * off
             drive.index_add_(0, self._ret, rd * self.retina_gain)
 
-        for name, encoder in self.sensory_encoders.items():
-            rows = getattr(self, f"sensor_rows_{name}")
-            feat = getattr(self, f"sensor_feat_{name}")
-            drive.index_add_(0, rows, encoder(proprio.index_select(1, feat)).T)
+        if len(self._oth):
+            enc = self.sensory_encoder(proprio)
+            drive.index_add_(0, self._oth, self.sensory_to_neurons(enc).T)
 
+        # No temporal recurrence: each decision is an independent sparse network
+        # evaluation. Iterations are depth/message passing within this decision.
+        h = torch.zeros(self.N, B, device=proprio.device, dtype=proprio.dtype)
         W = self._W()
         sign = self.presyn_sign()
-        lam = torch.sigmoid(self.leak_logit).unsqueeze(1)
-        h = state * self.cfg.carry
-
+        mix = torch.sigmoid(self.mix_logit).unsqueeze(1)
         for _ in range(self.cfg.n_iters):
             m = torch.sparse.mm(W, h * sign) + drive
             z = self.gain.unsqueeze(1) * m + self.bias.unsqueeze(1)
@@ -221,7 +179,7 @@ class ConnectomePolicy(nn.Module):
                 z = z + self.neuron_mlp(
                     torch.cat([m.unsqueeze(-1),
                                self.eta.unsqueeze(1).expand(-1, B, -1)], -1)).squeeze(-1)
-            h = (1 - lam) * h + lam * self.phi(z)
+            h = (1 - mix) * h + mix * self.phi(z)
 
         mean, group_feat = self.motor(h)
         value = self.value(torch.cat([proprio, group_feat], -1)).squeeze(-1)
@@ -230,8 +188,8 @@ class ConnectomePolicy(nn.Module):
     def dist(self, mean, log_std):
         return torch.distributions.Normal(mean, log_std.exp())
 
-    def act(self, obs, state, deterministic: bool = False):
-        mean, log_std, value, h = self.forward(obs, state)
+    def act(self, obs, state=None, deterministic: bool = False):
+        mean, log_std, value, h = self.forward(obs)
         if deterministic:
             return torch.tanh(mean), None, value, h
         d = self.dist(mean, log_std)
@@ -240,7 +198,7 @@ class ConnectomePolicy(nn.Module):
 
 
 class MotorDecoder(nn.Module):
-    """Efferent activity -> the 15 wing controls through anatomical motor groups."""
+    """Efferent activity -> 15 flight controls via anatomical motor groups."""
 
     WIRING: list[tuple[str, str, str, float]] = [
         ("power", "sum", "freq", 1.0),
@@ -272,7 +230,6 @@ class MotorDecoder(nn.Module):
             r = circuit.efferent[g]
             rows.append(torch.from_numpy(r))
             sides.append(torch.from_numpy(circuit.side_of(r).astype(np.float32)))
-        self.group_rows = rows
         for i, (r, s) in enumerate(zip(rows, sides)):
             self.register_buffer(f"rows_{i}", r)
             self.register_buffer(f"side_{i}", s)
@@ -285,14 +242,12 @@ class MotorDecoder(nn.Module):
         ci = {c: i for i, c in enumerate(WING_CONTROLS)}
         with torch.no_grad():
             for group, mode, ctrl, w in self.WIRING:
-                if group not in gi or ctrl not in ci:
-                    continue
-                col = 2 * gi[group] + (0 if mode == "sum" else 1)
-                self.readout.weight[ci[ctrl], col] = w
+                if group in gi and ctrl in ci:
+                    self.readout.weight[ci[ctrl], 2 * gi[group] + (0 if mode == "sum" else 1)] = w
 
-        self.all_rows = torch.cat(rows) if rows else torch.zeros(0, dtype=torch.long)
-        self.register_buffer("_all", self.all_rows)
-        self.residual = nn.Linear(max(len(self.all_rows), 1), action_dim)
+        all_rows = torch.cat(rows) if rows else torch.zeros(0, dtype=torch.long)
+        self.register_buffer("_all", all_rows)
+        self.residual = nn.Linear(max(len(all_rows), 1), action_dim)
         nn.init.normal_(self.residual.weight, std=0.01)
         nn.init.zeros_(self.residual.bias)
 
@@ -306,5 +261,4 @@ class MotorDecoder(nn.Module):
             denom = side.abs().sum().clamp(min=1.0)
             feats.append((a * side).sum(0) / denom)
         gf = torch.stack(feats, -1)
-        out = self.readout(gf) + self.residual(h[self._all].T)
-        return out, gf
+        return self.readout(gf) + self.residual(h[self._all].T), gf
