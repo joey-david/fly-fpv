@@ -14,29 +14,17 @@ def _add_train_args(t: argparse.ArgumentParser) -> None:
     g.add_argument("--config", help="YAML config file; CLI flags override it")
     g.add_argument("--run", dest="run_name", default=None, help="run name under --out-dir")
     g.add_argument("--out-dir", default=None, help="experiment root (default: runs)")
-    g.add_argument(
-        "--resume", nargs="?", const="latest", default=None,
-        help="resume PATH, or latest/best checkpoint for --run (bare --resume means latest)",
-    )
-    g.add_argument("--reset-optimizer", action="store_true", default=None,
-                   help="resume weights/counters but start Adam state fresh")
-    g.add_argument("--print-config", action="store_true",
-                   help="print the resolved YAML configuration and exit")
+    g.add_argument("--resume", nargs="?", const="latest", default=None,
+                   help="resume PATH, or latest/best checkpoint for --run")
+    g.add_argument("--reset-optimizer", action="store_true", default=None)
+    g.add_argument("--print-config", action="store_true")
 
     g = t.add_argument_group("model")
     g.add_argument("--arch", choices=["connectome", "shuffled", "erdos", "mlp"], default=None)
     g.add_argument("--scale", choices=["full", "flight", "core"], default=None)
     g.add_argument("--max-neurons", type=int, default=None)
     g.add_argument("--iters", dest="n_iters", type=int, default=None,
-                   help="connectome propagation iterations per 5 ms control tick")
-    g.add_argument("--tbptt", dest="tbptt_steps", type=int, default=None,
-                   help="temporal credit-assignment window in control steps")
-    g.add_argument("--state-carry", type=float, default=None,
-                   help="global state retention between control ticks, in [0,1]")
-    g.add_argument("--recurrent", action=argparse.BooleanOptionalAction, default=None,
-                   help="persistent connectome state (default on)")
-    g.add_argument("--stateless", action="store_true", default=None,
-                   help="alias for --no-recurrent; explicit ablation")
+                   help="sparse connectome message-passing depth per control decision")
     g.add_argument("--learn-synapses", action=argparse.BooleanOptionalAction, default=None)
     g.add_argument("--warmstart", dest="warmstart_steps", type=int, default=None,
                    help="expert transitions per environment; 0 disables behaviour cloning")
@@ -66,10 +54,8 @@ def _add_train_args(t: argparse.ArgumentParser) -> None:
     g.add_argument("--curriculum-rate", type=float, default=None)
 
     g = t.add_argument_group("runtime")
-    g.add_argument("--save-every", type=int, default=None,
-                   help="checkpoint every N PPO updates; 0 = only final/interrupt")
-    g.add_argument("--keep-checkpoints", type=int, default=None,
-                   help="number of recent numbered checkpoints to retain")
+    g.add_argument("--save-every", type=int, default=None)
+    g.add_argument("--keep-checkpoints", type=int, default=None)
     g.add_argument("--best-metric", choices=["ep_gates", "ep_return"], default=None)
     g.add_argument("--monitor", action=argparse.BooleanOptionalAction, default=None)
     g.add_argument("--port", type=int, default=8777)
@@ -80,17 +66,13 @@ def _add_train_args(t: argparse.ArgumentParser) -> None:
 def _train_overrides(a) -> dict:
     top_names = [
         "run_name", "out_dir", "reset_optimizer", "arch", "scale", "max_neurons",
-        "n_iters", "tbptt_steps", "state_carry", "recurrent", "learn_synapses",
-        "warmstart_steps", "total_steps", "n_envs", "rollout", "epochs", "minibatches",
-        "lr", "gamma", "gae_lambda", "clip", "vf_coef", "ent_coef", "max_grad_norm",
-        "target_kl", "curriculum", "curriculum_target", "curriculum_rate", "save_every",
-        "keep_checkpoints", "best_metric", "monitor", "seed", "device",
+        "n_iters", "learn_synapses", "warmstart_steps", "total_steps", "n_envs",
+        "rollout", "epochs", "minibatches", "lr", "gamma", "gae_lambda", "clip",
+        "vf_coef", "ent_coef", "max_grad_norm", "target_kl", "curriculum",
+        "curriculum_target", "curriculum_rate", "save_every", "keep_checkpoints",
+        "best_metric", "monitor", "seed", "device",
     ]
     out = {name: getattr(a, name) for name in top_names if getattr(a, name) is not None}
-    if a.stateless:
-        if a.recurrent is True:
-            raise ValueError("--stateless conflicts with --recurrent")
-        out["recurrent"] = False
     env = {
         "n_gates": a.gates,
         "difficulty": a.difficulty,
@@ -176,7 +158,7 @@ def _show_runs(out_dir: str, run: str | None) -> int:
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="flypv",
-        description="Reinforcement learning on the Drosophila MaleCNS connectome.",
+        description="Train sparse policies on the Drosophila MaleCNS graph.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -188,12 +170,9 @@ def main(argv=None):
     b = sub.add_parser("build", help="build and cache the filtered connectome")
     b.add_argument("--min-synapses", type=int, default=5)
 
-    c = sub.add_parser("circuit", help="describe the extracted flight circuit")
+    c = sub.add_parser("circuit", help="describe the extracted policy graph")
     c.add_argument("--scale", default="flight", choices=["full", "flight", "core"])
-    c.add_argument("--hops", type=int, default=3,
-                   help="sensor/motor graph radius (default: 3 each way)")
-    c.add_argument("--closure-hops", type=int, default=1,
-                   help="layers of locally recurrent side loops to retain")
+    c.add_argument("--hops", type=int, default=2)
     c.add_argument("--max-neurons", type=int, default=None)
 
     t = sub.add_parser("train", help="train the fly")
@@ -207,7 +186,6 @@ def main(argv=None):
     m.add_argument("--port", type=int, default=8777)
 
     a = ap.parse_args(argv)
-
     try:
         if a.cmd == "fetch":
             from .connectome.sources import LICENSE_NOTE, curl_commands, fetch
@@ -225,12 +203,7 @@ def main(argv=None):
 
         if a.cmd == "circuit":
             from .connectome import build_flight_circuit
-            build_flight_circuit(
-                scale=a.scale,
-                hops=a.hops,
-                recurrent_closure_hops=a.closure_hops,
-                max_neurons=a.max_neurons,
-            )
+            build_flight_circuit(scale=a.scale, hops=a.hops, max_neurons=a.max_neurons)
             return 0
 
         if a.cmd == "runs":
@@ -247,7 +220,6 @@ def main(argv=None):
             if a.print_config:
                 print(yaml.safe_dump(cfg.to_dict(), sort_keys=False), end="")
                 return 0
-
             from .monitor import serve_background
             from .train import train
             if cfg.monitor:
@@ -256,7 +228,6 @@ def main(argv=None):
             return 0
     except (ValueError, FileNotFoundError, TypeError) as exc:
         ap.error(str(exc))
-
     return 1
 
 
