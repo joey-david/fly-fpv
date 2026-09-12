@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+data/raw/*.feather
+data/cache/*.npz
+data/cache/*.json
+runs/*/
+!runs/.gitkeep
+.DS_Store

@@ -1,0 +1,84 @@
+[flypv] monitor -> http://127.0.0.1:8777
+[flypv] building the flight circuit (scale=flight) ...
+[connectome] cache hit -> malecns-v1.0-syn5-all.npz
+[circuit] seeds: 16,475 sensory, 431 motor
+[circuit] 139,266 within 2 hops of a sensor, 13,633 within 2 hops of a muscle, 12,891 on a path between
+[circuit]
+male-cns-v1.0: 28,361 neurons, 534,681 connections, 12,151,092 synapses, 60% excitatory
+    ol_intrinsic            16,955
+    vnc_intrinsic            4,153
+    cb_intrinsic             2,144
+    vnc_sensory              1,301
+    cb_sensory                 944
+    descending_neuron          699
+    ascending_neuron           618
+    vnc_motor                  491
+    sensory_ascending          448
+    visual_projection          234
+    visual_centrifugal         118
+    cb_motor                   107
+
+  afferent ports:
+    retina       14,201   per-ommatidium luminance and temporal contrast
+    haltere         205   body angular velocity (gyro)
+    johnston        672   airspeed / wind
+    wing_cs         857   wing strain and load
+    hairplate       115   joint angle / head-body angle
+    chordotonal     425   limb proprioception
+  efferent groups:
+    power            12   wingbeat amplitude / frequency drive
+    basalar           6   stroke amplitude + downstroke deviation
+    axillary          8   stroke plane / wing rotation
+    hinge             8   angle of attack
+    pterale          10   stroke offset / upstroke deviation
+    wing_misc         4   hinge tension
+    neck            107   head pitch / yaw (gaze stabilisation)
+    abdomen         276   abdomen pitch (trim)
+  intrinsic:     11,455
+[flypv] connectome: 355,430 trainable parameters
+[warmstart] collecting 9,600 expert transitions ...
+/Users/joey/projects/ai-ml/flypv/flypv/policy/connectome_policy.py:195: UserWarning: Sparse invariant checks are implicitly disabled. Memory errors (e.g. SEGFAULT) will occur when operating on a sparse tensor which violates the invariants, but checks incur performance overhead. To silence this warning, explicitly opt in or out. See `torch.sparse.check_sparse_tensor_invariants.__doc__` for guidance.  (Triggered internally at /Users/runner/work/pytorch/pytorch/aten/src/ATen/Context.cpp:855.)
+  return torch.sparse_coo_tensor(self.w_idx, val, (self.N, self.N),
+[warmstart] epoch 1/8  action MSE 0.06718
+[warmstart] epoch 2/8  action MSE 0.05812
+[warmstart] epoch 3/8  action MSE 0.05631
+[warmstart] epoch 4/8  action MSE 0.05543
+[warmstart] epoch 5/8  action MSE 0.05456
+[warmstart] epoch 6/8  action MSE 0.05129
+[warmstart] epoch 7/8  action MSE 0.04502
+[warmstart] epoch 8/8  action MSE 0.03880
+[    4,096] ret  -19.99 | gates 0.00/8 | crash 1.00 | diff 0.39 | ent  -2.72 | kl 0.0916 |    580 fps
+[    8,192] ret  -20.49 | gates 0.00/8 | crash 1.00 | diff 0.38 | ent  -2.72 | kl 0.0308 |    594 fps
+[   12,288] ret  -20.14 | gates 0.00/8 | crash 1.00 | diff 0.37 | ent  -2.72 | kl 0.0227 |    264 fps
+[   16,384] ret  -20.24 | gates 0.00/8 | crash 1.00 | diff 0.36 | ent  -2.73 | kl 0.0411 |    329 fps
+[   20,480] ret  -19.50 | gates 0.00/8 | crash 1.00 | diff 0.35 | ent  -2.73 | kl 0.0414 |    436 fps
+[   24,576] ret  -18.44 | gates 0.00/8 | crash 1.00 | diff 0.34 | ent  -2.74 | kl 0.0310 |    408 fps
+[   28,672] ret  -19.08 | gates 0.00/8 | crash 1.00 | diff 0.33 | ent  -2.74 | kl 0.0312 |    426 fps
+[   32,768] ret  -19.93 | gates 0.00/8 | crash 1.00 | diff 0.32 | ent  -2.75 | kl 0.0252 |    434 fps
+[   36,864] ret  -19.30 | gates 0.00/8 | crash 1.00 | diff 0.31 | ent  -2.75 | kl 0.0263 |    371 fps
+[   40,960] ret  -19.08 | gates 0.00/8 | crash 1.00 | diff 0.30 | ent  -2.75 | kl 0.0257 |    436 fps
+[   45,056] ret  -19.95 | gates 0.00/8 | crash 1.00 | diff 0.29 | ent  -2.75 | kl 0.0354 |    567 fps
+[   49,152] ret  -18.74 | gates 0.00/8 | crash 1.00 | diff 0.28 | ent  -2.75 | kl 0.0270 |    354 fps
+[   53,248] ret  -18.95 | gates 0.00/8 | crash 1.00 | diff 0.27 | ent  -2.76 | kl 0.0315 |    385 fps
+[   57,344] ret  -19.51 | gates 0.00/8 | crash 1.00 | diff 0.26 | ent  -2.76 | kl 0.0230 |    338 fps
+[   61,440] ret  -18.60 | gates 0.00/8 | crash 1.00 | diff 0.25 | ent  -2.78 | kl 0.0285 |    319 fps
+[   65,536] ret  -17.87 | gates 0.00/8 | crash 1.00 | diff 0.24 | ent  -2.81 | kl 0.0195 |    254 fps
+[   69,632] ret  -18.96 | gates 0.00/8 | crash 1.00 | diff 0.23 | ent  -2.82 | kl 0.0242 |    336 fps
+[   73,728] ret  -18.74 | gates 0.00/8 | crash 1.00 | diff 0.22 | ent  -2.82 | kl 0.0209 |    286 fps
+[   77,824] ret  -19.45 | gates 0.00/8 | crash 1.00 | diff 0.21 | ent  -2.82 | kl 0.0232 |    239 fps
+[   81,920] ret  -18.13 | gates 0.00/8 | crash 1.00 | diff 0.20 | ent  -2.84 | kl 0.0199 |    256 fps
+[   86,016] ret  -17.72 | gates 0.00/8 | crash 1.00 | diff 0.19 | ent  -2.86 | kl 0.0191 |    244 fps
+[   90,112] ret  -18.41 | gates 0.01/8 | crash 1.00 | diff 0.18 | ent  -2.87 | kl 0.0214 |    291 fps
+[   94,208] ret  -18.61 | gates 0.00/8 | crash 1.00 | diff 0.17 | ent  -2.88 | kl 0.0228 |    258 fps
+[   98,304] ret  -17.86 | gates 0.01/8 | crash 1.00 | diff 0.16 | ent  -2.89 | kl 0.0254 |    283 fps
+[  102,400] ret  -17.83 | gates 0.00/8 | crash 1.00 | diff 0.15 | ent  -2.90 | kl 0.0237 |    254 fps
+[  106,496] ret  -16.23 | gates 0.00/8 | crash 1.00 | diff 0.14 | ent  -2.91 | kl 0.0165 |    254 fps
+[  110,592] ret  -18.06 | gates 0.00/8 | crash 1.00 | diff 0.13 | ent  -2.91 | kl 0.0194 |    258 fps
+[  114,688] ret  -16.49 | gates 0.00/8 | crash 1.00 | diff 0.12 | ent  -2.92 | kl 0.0195 |    270 fps
+[  118,784] ret  -16.77 | gates 0.02/8 | crash 1.00 | diff 0.11 | ent  -2.94 | kl 0.0222 |    353 fps
+[  122,880] ret  -16.94 | gates 0.00/8 | crash 1.00 | diff 0.10 | ent  -2.95 | kl 0.0188 |    256 fps
+[  126,976] ret  -17.44 | gates 0.00/8 | crash 1.00 | diff 0.09 | ent  -2.98 | kl 0.0204 |    291 fps
+[  131,072] ret  -15.97 | gates 0.00/8 | crash 1.00 | diff 0.08 | ent  -3.00 | kl 0.0222 |    264 fps
+[  135,168] ret  -15.44 | gates 0.00/8 | crash 1.00 | diff 0.07 | ent  -3.01 | kl 0.0206 |    247 fps
+[  139,264] ret  -13.62 | gates 0.01/8 | crash 1.00 | diff 0.06 | ent  -3.02 | kl 0.0196 |    256 fps
+[  143,360] ret  -13.29 | gates 0.00/8 | crash 1.00 | diff 0.05 | ent  -3.03 | kl 0.0217 |    247 fps

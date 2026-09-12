@@ -1,0 +1,58 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>flypv monitor</title>
+<link rel="stylesheet" href="/static/style.css">
+
+<header class="bar">
+  <div class="ident">
+    <span class="mark" aria-hidden="true"></span>
+    <h1>flypv</h1>
+    <p id="dataset">waiting for the trainer</p>
+  </div>
+  <dl class="counters" id="counters"></dl>
+  <div class="conn" id="conn"><i></i>offline</div>
+</header>
+
+<main>
+  <section class="stage" id="stage">
+    <div class="panel-head">
+      <h2>Central nervous system</h2>
+      <p id="graph-note">Drag to rotate. Brain at the top, nerve cord below; every dot is a neuron at its own soma position.</p>
+    </div>
+    <div class="stage-canvas"><canvas id="graph"></canvas><div id="tip" hidden></div></div>
+    <ul class="key" id="key"></ul>
+  </section>
+
+  <aside class="rail">
+    <section class="panel">
+      <div class="panel-head"><h2>What the fly sees</h2>
+        <p>Left and right eye, one cell per ommatidium.</p></div>
+      <canvas id="eye"></canvas>
+      <p class="caption">Rows: raw luminance, then the ON and OFF channels the
+        lamina splits it into at the first synapse. Left eye on the left.</p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Course</h2><p id="course-note">gate 0</p></div>
+      <canvas id="course"></canvas>
+    </section>
+  </aside>
+
+  <section class="panel wide">
+    <div class="panel-head"><h2>Wingbeat</h2><p id="wing-note"></p></div>
+    <canvas id="wing"></canvas>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Flight muscles</h2><p>Mean firing rate per motor pool.</p></div>
+    <div class="bars" id="motor"></div>
+  </section>
+
+  <section class="panel wide2">
+    <div class="panel-head"><h2>Learning</h2><p id="curve-note"></p></div>
+    <canvas id="curves"></canvas>
+    <ul class="legend" id="curve-key"></ul>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
