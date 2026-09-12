@@ -95,6 +95,10 @@ class TrainConfig:
     def from_dict(cls, data: dict[str, Any]) -> "TrainConfig":
         if not isinstance(data, dict):
             raise TypeError("training config must be a mapping")
+        # Legacy v0.1 checkpoints carried this unused field. Ignore it so old
+        # policy snapshots can still be imported as warm resume points.
+        data = dict(data)
+        data.pop("monitor_every", None)
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:
