@@ -1,29 +1,14 @@
-"""PPO over the connectome policy.
+"""PPO for the connectome policy, with persistent neural state and TBPTT.
 
-Two design notes that are not standard boilerplate:
-
-**Why the default policy is stateless across control steps.** The neural state
-`h` has one entry per neuron — 28,361 of them — so storing it for every step of
-every environment in a rollout would cost hundreds of megabytes and make
-minibatching miserable. With `carry = 0` the network instead settles for
-`n_iters` synaptic hops from a zeroed state on each control step, which is the
-same formulation the connectome-graph-policy literature uses, and it is
-consistent with how the circuit was extracted: the subgraph contains exactly the
-neurons within a few synapses of a sensor and a few of a muscle. Set
-`recurrent=True` for genuine across-step memory; the trainer then switches to
-sequence minibatches over environments and replays the state.
-
-**Why the action is squashed after sampling.** The Gaussian is on the raw
-pre-tanh action and the log-prob is corrected for the tanh Jacobian, so the
-15 wing controls stay inside their physiological travel without the
-distribution silently lying about its density at the boundary.
+The default model carries the connectome's neural state across 5 ms control
+steps. During optimization, gradients are replayed through short temporal
+chunks and truncated at chunk boundaries; the state itself is not reset there.
+Use ``recurrent=False`` only as the explicit stateless ablation.
 """
 from __future__ import annotations
 
-import json
 import math
 import time
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 import numpy as np
@@ -31,60 +16,17 @@ import torch
 import torch.nn as nn
 
 from ..connectome import build_flight_circuit
-from ..env import EnvConfig, HoopRaceEnv
+from ..env import HoopRaceEnv
 from ..monitor.bus import BUS
 from ..policy import ConnectomePolicy, MLPPolicy, PolicyConfig, shuffle_connectome
+from .checkpoint import CheckpointManager
+from .config import TrainConfig, save_yaml
 
 
-@dataclass
-class TrainConfig:
-    total_steps: int = 5_000_000
-    rollout: int = 128
-    n_envs: int = 32
-    epochs: int = 4
-    minibatches: int = 8
-    lr: float = 3e-4
-    gamma: float = 0.999   # 200 Hz control, so this is a ~5 s horizon
-    gae_lambda: float = 0.95
-    clip: float = 0.2
-    vf_coef: float = 0.5
-    ent_coef: float = 0.004
-    max_grad_norm: float = 0.75
-    target_kl: float = 0.03
-    recurrent: bool = False
-    warmstart_steps: int = 400   # expert transitions per env for behaviour cloning; 0 disables
-
-    arch: str = "connectome"        # connectome | shuffled | erdos | mlp
-    scale: str = "flight"           # full | flight | core
-    max_neurons: int | None = None
-    n_iters: int = 4
-    learn_synapses: bool = False
-
-    # curriculum: raise course difficulty once the fly is reliably clearing gates
-    curriculum: bool = True
-    curriculum_target: float = 0.72   # fraction of gates cleared per episode
-    curriculum_rate: float = 0.02
-
-    device: str = "auto"
-    seed: int = 0
-    run_name: str = "flypv"
-    out_dir: str = "runs"
-    monitor: bool = True
-    monitor_every: int = 1
-    save_every: int = 40
-    env: EnvConfig = field(default_factory=EnvConfig)
+STRUCTURAL_RESUME_FIELDS = ("arch", "scale", "max_neurons", "learn_synapses")
 
 
 def pick_device(pref: str = "auto") -> str:
-    """Prefer the GPU. On Apple Silicon that means Metal via MPS.
-
-    Measured on this model — 28,361 neurons, 534,681 edges, batch 512, forward
-    and backward — MPS runs about 1.9x faster than CPU and agrees with it to
-    1.2e-07, i.e. float32 exactly. `torch.sparse.mm`, which dominates the cost,
-    is supported on MPS and is roughly 7x faster there than on CPU; the manual
-    gather-and-index_add_ formulation people reach for when they assume sparse
-    is unsupported is *slower* on both devices, so do not "optimise" into it.
-    """
     if pref != "auto":
         return pref
     if torch.cuda.is_available():
@@ -96,62 +38,124 @@ def pick_device(pref: str = "auto") -> str:
 
 class PPO:
     def __init__(self, cfg: TrainConfig):
+        cfg.validate()
+        if cfg.arch == "mlp" and cfg.recurrent:
+            print("[flypv] MLP baseline is feed-forward; disabling recurrent/TBPTT mode")
+            cfg.recurrent = False
         self.cfg = cfg
+        self.device = pick_device(cfg.device)
         torch.manual_seed(cfg.seed)
         np.random.seed(cfg.seed)
-        self.device = pick_device(cfg.device)
 
-        ecfg = cfg.env
-        ecfg.n_envs = cfg.n_envs
-        ecfg.seed = cfg.seed
-
+        cfg.env.n_envs = cfg.n_envs
+        cfg.env.seed = cfg.seed
         print(f"[flypv] building the flight circuit (scale={cfg.scale}) ...")
         self.circuit = build_flight_circuit(scale=cfg.scale, max_neurons=cfg.max_neurons)
-
-        self.env = HoopRaceEnv(ecfg, hex_coords=self.circuit.hex_coords)
+        self.env = HoopRaceEnv(cfg.env, hex_coords=self.circuit.hex_coords)
         self.policy = self._build_policy()
         print(f"[flypv] {cfg.arch}: {self.policy.n_trainable():,} trainable parameters")
 
-        self.opt = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr, eps=1e-5)
+        self.opt = self._new_optimizer()
         self.out = Path(cfg.out_dir) / cfg.run_name
         self.out.mkdir(parents=True, exist_ok=True)
-        (self.out / "config.json").write_text(json.dumps(_jsonable(asdict(cfg)), indent=2))
+        self.checkpoints = CheckpointManager(
+            self.out, keep=cfg.keep_checkpoints, best_metric=cfg.best_metric
+        )
 
         self.global_step = 0
         self.updates = 0
         self.t_start = time.time()
-        self._ep_stats = {"return": [], "gates": [], "crash": [], "length": [], "power": []}
+        self.elapsed_before_resume = 0.0
+        self._ep_stats = {"return": [], "gates": [], "crash": [], "length": []}
+        self._last_metrics: dict[str, float] = {}
+        self._resumed = False
+
+        if cfg.resume:
+            path = self.checkpoints.resolve(self.out, cfg.resume)
+            self._load_checkpoint(path)
+
+        resolved = TrainConfig.from_dict(cfg.to_dict())
+        resolved.resume = None
+        resolved.reset_optimizer = False
+        save_yaml(resolved, self.out / "config.yaml")
 
         if cfg.monitor:
             from ..monitor.publish import publish_static
             publish_static(self.circuit, self.env, self.policy, cfg)
 
-    # ------------------------------------------------------------------
+    def _new_optimizer(self):
+        return torch.optim.Adam(self.policy.parameters(), lr=self.cfg.lr, eps=1e-5)
+
     def _build_policy(self):
         cfg = self.cfg
-        pc = PolicyConfig(n_iters=cfg.n_iters, carry=0.0 if not cfg.recurrent else 0.5,
-                          learn_synapses=cfg.learn_synapses)
+        pc = PolicyConfig(
+            n_iters=cfg.n_iters,
+            carry=cfg.state_carry if cfg.recurrent else 0.0,
+            learn_synapses=cfg.learn_synapses,
+        )
         if cfg.arch == "connectome":
-            return ConnectomePolicy(self.circuit, self.env.PROPRIO_DIM,
-                                    self.env.action_dim, pc, self.device)
+            return ConnectomePolicy(
+                self.circuit, self.env.PROPRIO_DIM, self.env.action_dim, pc, self.device
+            )
         if cfg.arch in ("shuffled", "erdos"):
             mode = "degree" if cfg.arch == "shuffled" else "erdos"
-            c = shuffle_connectome(self.circuit, mode, seed=cfg.seed)
-            return ConnectomePolicy(c, self.env.PROPRIO_DIM, self.env.action_dim, pc, self.device)
+            circuit = shuffle_connectome(self.circuit, mode, seed=cfg.seed)
+            return ConnectomePolicy(
+                circuit, self.env.PROPRIO_DIM, self.env.action_dim, pc, self.device
+            )
         if cfg.arch == "mlp":
-            return MLPPolicy(self.env.PROPRIO_DIM, self.env.n_columns,
-                             self.env.action_dim, log_std_init=pc.log_std_init,
-                             device=self.device)
+            return MLPPolicy(
+                self.env.PROPRIO_DIM,
+                self.env.n_columns,
+                self.env.action_dim,
+                log_std_init=pc.log_std_init,
+                device=self.device,
+            )
         raise ValueError(cfg.arch)
 
-    # ------------------------------------------------------------------
+    def _load_checkpoint(self, path: Path) -> None:
+        payload = CheckpointManager.load(path, map_location="cpu")
+        saved_cfg = payload.get("cfg") or {}
+        for key in STRUCTURAL_RESUME_FIELDS:
+            old = saved_cfg.get(key)
+            new = getattr(self.cfg, key)
+            if old != new:
+                raise ValueError(
+                    f"cannot resume with {key}={new!r}; checkpoint was built with {key}={old!r}"
+                )
+        if self.cfg.arch == "mlp":
+            old_vision = (saved_cfg.get("env") or {}).get("vision", True)
+            if old_vision != self.cfg.env.vision:
+                raise ValueError("MLP checkpoints cannot change vision mode on resume")
+
+        self.policy.load_state_dict(payload["policy"], strict=True)
+        if self.cfg.reset_optimizer:
+            self.opt = self._new_optimizer()
+        else:
+            self.opt.load_state_dict(payload["optimizer"])
+            for group in self.opt.param_groups:
+                group["lr"] = self.cfg.lr
+
+        self.global_step = int(payload.get("step", 0))
+        self.updates = int(payload.get("updates", 0))
+        self.env.cfg.difficulty = float(payload.get("difficulty", self.env.cfg.difficulty))
+        self.elapsed_before_resume = float(payload.get("elapsed", 0.0))
+        loaded_stats = payload.get("ep_stats") or {}
+        for key in self._ep_stats:
+            self._ep_stats[key] = list(loaded_stats.get(key, []))[-400:]
+        CheckpointManager.restore_rng(payload)
+        self._resumed = True
+        print(
+            f"[flypv] resumed {path.name} at step {self.global_step:,}, "
+            f"update {self.updates:,}, difficulty {self.env.cfg.difficulty:.2f}"
+        )
+        print("[flypv] physical environments restart fresh; policy/optimizer/curriculum continue")
+
     def _to_torch(self, obs: dict) -> dict:
         return {k: torch.from_numpy(v).to(self.device) for k, v in obs.items()}
 
-    @torch.no_grad()
-    def rollout(self, obs: dict, state: torch.Tensor):
-        cfg = self.cfg
-        T, E = cfg.rollout, cfg.n_envs
+    def _empty_buffer(self, obs: dict) -> dict[str, torch.Tensor]:
+        T, E = self.cfg.rollout, self.cfg.n_envs
         buf = {
             "proprio": torch.zeros(T, E, self.env.PROPRIO_DIM, device=self.device),
             "raw": torch.zeros(T, E, self.env.action_dim, device=self.device),
@@ -159,23 +163,40 @@ class PPO:
             "val": torch.zeros(T, E, device=self.device),
             "rew": torch.zeros(T, E, device=self.device),
             "done": torch.zeros(T, E, device=self.device),
+            "timeout_value": torch.zeros(T, E, device=self.device),
         }
-        has_vision = "on" in obs
-        if has_vision:
+        if "on" in obs:
             C = obs["on"].shape[1]
             buf["on"] = torch.zeros(T, E, C, device=self.device)
             buf["off"] = torch.zeros(T, E, C, device=self.device)
+        return buf
 
-        state0 = state.clone()
+    @torch.no_grad()
+    def rollout(self, obs: dict, state: torch.Tensor):
+        cfg = self.cfg
+        T, E = cfg.rollout, cfg.n_envs
+        buf = self._empty_buffer(obs)
+
+        if cfg.recurrent:
+            n_chunks = math.ceil(T / cfg.tbptt_steps)
+            state_starts = torch.empty(
+                (n_chunks, *state.shape), dtype=state.dtype, device="cpu"
+            )
+        else:
+            state_starts = None
+
         for t in range(T):
+            if cfg.recurrent and t % cfg.tbptt_steps == 0:
+                state_starts[t // cfg.tbptt_steps].copy_(state.detach().cpu())
+
             to = self._to_torch(obs)
             buf["proprio"][t] = to["proprio"]
-            if has_vision:
-                buf["on"][t] = to["on"]; buf["off"][t] = to["off"]
+            if "on" in buf:
+                buf["on"][t] = to["on"]
+                buf["off"][t] = to["off"]
 
             action, logp, value, state, raw = self.policy.act(to, state)
-            a = action.cpu().numpy()
-            obs, rew, term, trunc, info = self.env.step(a)
+            obs, rew, term, trunc, info = self.env.step(action.cpu().numpy())
             done = term | trunc
 
             buf["raw"][t] = raw
@@ -184,30 +205,41 @@ class PPO:
             buf["rew"][t] = torch.from_numpy(rew).float().to(self.device)
             buf["done"][t] = torch.from_numpy(done.astype(np.float32)).to(self.device)
 
+            trunc_only = trunc & ~term
+            if trunc_only.any() and "final_obs" in info:
+                ids_np = np.flatnonzero(trunc_only)
+                ids = torch.from_numpy(ids_np.astype(np.int64)).to(self.device)
+                final_obs = {
+                    k: torch.from_numpy(v[ids_np]).to(self.device)
+                    for k, v in info["final_obs"].items()
+                }
+                final_state = state.index_select(1, ids)
+                _, _, final_value, _ = self.policy.forward(final_obs, final_state)
+                buf["timeout_value"][t].index_copy_(0, ids, final_value)
+
             if done.any():
                 state = state.clone()
-                state[:, torch.from_numpy(done)] = 0.0
+                mask = torch.from_numpy(done).to(state.device)
+                state[:, mask] = 0.0
                 self._log_episodes(info, done)
-            self.global_step += E
 
-            if self.cfg.monitor and (t % 8 == 0):
+            self.global_step += E
+            if cfg.monitor and t % 8 == 0:
                 self._publish_live(info, state)
 
-        with torch.no_grad():
-            _, _, last_val, _ = self.policy.forward(self._to_torch(obs), state)
-        return buf, obs, state, state0, last_val
+        _, _, last_val, _ = self.policy.forward(self._to_torch(obs), state)
+        return buf, obs, state, state_starts, last_val
 
     def _log_episodes(self, info, done):
-        d = np.flatnonzero(done)
-        self._ep_stats["return"] += info["episode_return"][d].tolist()
-        self._ep_stats["length"] += info["episode_length"][d].tolist()
-        self._ep_stats["gates"] += info["gates_done"][d].tolist()
-        self._ep_stats["crash"] += info["crashed"][d].astype(float).tolist()
-        for k in self._ep_stats:
-            if len(self._ep_stats[k]) > 400:
-                self._ep_stats[k] = self._ep_stats[k][-400:]
+        ids = np.flatnonzero(done)
+        self._ep_stats["return"] += info["episode_return"][ids].tolist()
+        self._ep_stats["length"] += info["episode_length"][ids].tolist()
+        self._ep_stats["gates"] += info["gates_done"][ids].tolist()
+        self._ep_stats["crash"] += info["crashed"][ids].astype(float).tolist()
+        for key in self._ep_stats:
+            if len(self._ep_stats[key]) > 400:
+                self._ep_stats[key] = self._ep_stats[key][-400:]
 
-    # ------------------------------------------------------------------
     def gae(self, buf, last_val):
         cfg = self.cfg
         T = cfg.rollout
@@ -216,65 +248,161 @@ class PPO:
         for t in reversed(range(T)):
             nextval = last_val if t == T - 1 else buf["val"][t + 1]
             nonterm = 1.0 - buf["done"][t]
-            delta = buf["rew"][t] + cfg.gamma * nextval * nonterm - buf["val"][t]
+            delta = (
+                buf["rew"][t]
+                + cfg.gamma * nextval * nonterm
+                + cfg.gamma * buf["timeout_value"][t]
+                - buf["val"][t]
+            )
             gae = delta + cfg.gamma * cfg.gae_lambda * nonterm * gae
             adv[t] = gae
         return adv, adv + buf["val"]
 
     def _logp(self, mean, log_std, raw):
         from ..policy.connectome_policy import squashed_log_prob
-        d = torch.distributions.Normal(mean, log_std.exp())
-        return squashed_log_prob(d, raw), d.entropy().sum(-1)
+        dist = torch.distributions.Normal(mean, log_std.exp())
+        return squashed_log_prob(dist, raw), dist.entropy().sum(-1)
 
-    def update(self, buf, adv, ret, state0):
+    def update(self, buf, adv, ret, state_starts):
+        if self.cfg.recurrent:
+            return self._update_recurrent(buf, adv, ret, state_starts)
+        return self._update_stateless(buf, adv, ret)
+
+    def _update_stateless(self, buf, adv, ret):
         cfg = self.cfg
         T, E = cfg.rollout, cfg.n_envs
-        flat = lambda x: x.reshape(T * E, *x.shape[2:])
+
+        def flat(x):
+            return x.reshape(T * E, *x.shape[2:])
+
         b = {k: flat(v) for k, v in buf.items()}
         b_adv, b_ret = flat(adv), flat(ret)
         b_adv = (b_adv - b_adv.mean()) / (b_adv.std() + 1e-8)
-
         n = T * E
-        mb = n // cfg.minibatches
-        idx = np.arange(n)
-        stats = {"pg": [], "vf": [], "ent": [], "kl": [], "clipfrac": []}
+        mb = max(1, n // cfg.minibatches)
+        order = np.arange(n)
+        stats = self._empty_update_stats()
 
-        for ep in range(cfg.epochs):
-            np.random.shuffle(idx)
-            for s in range(0, n, mb):
-                j = torch.from_numpy(idx[s : s + mb]).to(self.device)
-                obs = {"proprio": b["proprio"][j]}
+        for _ in range(cfg.epochs):
+            np.random.shuffle(order)
+            epoch_kls = []
+            for start in range(0, n, mb):
+                idx = torch.from_numpy(order[start : start + mb]).to(self.device)
+                obs = {"proprio": b["proprio"][idx]}
                 if "on" in b:
-                    obs["on"] = b["on"][j]; obs["off"] = b["off"][j]
-
-                st = self.policy.init_state(len(j))
-                mean, log_std, value, _ = self.policy.forward(obs, st)
-                logp, ent = self._logp(mean, log_std, b["raw"][j])
-
-                ratio = (logp - b["logp"][j]).exp()
-                a = b_adv[j]
-                pg = -torch.min(ratio * a,
-                                torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * a).mean()
-                vf = 0.5 * (value - b_ret[j]).pow(2).mean()
-                ent_m = ent.mean()
-                loss = pg + cfg.vf_coef * vf - cfg.ent_coef * ent_m
-
-                self.opt.zero_grad(set_to_none=True)
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
-                self.opt.step()
-
-                with torch.no_grad():
-                    kl = ((ratio - 1) - (logp - b["logp"][j])).mean()
-                stats["pg"].append(pg.item()); stats["vf"].append(vf.item())
-                stats["ent"].append(ent_m.item()); stats["kl"].append(kl.item())
-                stats["clipfrac"].append(((ratio - 1).abs() > cfg.clip).float().mean().item())
-
-            if np.mean(stats["kl"][-cfg.minibatches:]) > cfg.target_kl:
+                    obs["on"] = b["on"][idx]
+                    obs["off"] = b["off"][idx]
+                state = self.policy.init_state(len(idx))
+                mean, log_std, value, _ = self.policy.forward(obs, state)
+                logp, ent = self._logp(mean, log_std, b["raw"][idx])
+                batch_stats = self._optimize_batch(
+                    logp, ent, value, b["logp"][idx], b_adv[idx], b_ret[idx]
+                )
+                self._append_stats(stats, batch_stats)
+                epoch_kls.append(batch_stats["kl"])
+            if epoch_kls and float(np.mean(epoch_kls)) > cfg.target_kl:
                 break
-        return {k: float(np.mean(v)) for k, v in stats.items()}
+        return self._mean_stats(stats)
 
-    # ------------------------------------------------------------------
+    def _update_recurrent(self, buf, adv, ret, state_starts):
+        cfg = self.cfg
+        T, E, K = cfg.rollout, cfg.n_envs, cfg.tbptt_steps
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        target_samples = max(1, (T * E) // cfg.minibatches)
+        env_batch = max(1, min(E, math.ceil(target_samples / K)))
+        n_chunks = math.ceil(T / K)
+        stats = self._empty_update_stats()
+
+        for _ in range(cfg.epochs):
+            stop_early = False
+            for ci in np.random.permutation(n_chunks):
+                t0, t1 = ci * K, min((ci + 1) * K, T)
+                chunk_kls = []
+                env_order = np.random.permutation(E)
+                for start in range(0, E, env_batch):
+                    env_np = env_order[start : start + env_batch]
+                    env_cpu = torch.from_numpy(env_np.astype(np.int64))
+                    env_idx = env_cpu.to(self.device)
+                    state = state_starts[ci].index_select(1, env_cpu).to(self.device).detach()
+
+                    logps, ents, values = [], [], []
+                    old_logps, advs, targets = [], [], []
+                    for t in range(t0, t1):
+                        obs = {"proprio": buf["proprio"][t].index_select(0, env_idx)}
+                        if "on" in buf:
+                            obs["on"] = buf["on"][t].index_select(0, env_idx)
+                            obs["off"] = buf["off"][t].index_select(0, env_idx)
+                        mean, log_std, value, state = self.policy.forward(obs, state)
+                        raw = buf["raw"][t].index_select(0, env_idx)
+                        logp, ent = self._logp(mean, log_std, raw)
+                        logps.append(logp)
+                        ents.append(ent)
+                        values.append(value)
+                        old_logps.append(buf["logp"][t].index_select(0, env_idx))
+                        advs.append(adv[t].index_select(0, env_idx))
+                        targets.append(ret[t].index_select(0, env_idx))
+                        alive = 1.0 - buf["done"][t].index_select(0, env_idx)
+                        state = state * alive.unsqueeze(0)
+
+                    batch_stats = self._optimize_batch(
+                        torch.stack(logps),
+                        torch.stack(ents),
+                        torch.stack(values),
+                        torch.stack(old_logps),
+                        torch.stack(advs),
+                        torch.stack(targets),
+                    )
+                    self._append_stats(stats, batch_stats)
+                    chunk_kls.append(batch_stats["kl"])
+
+                if chunk_kls and float(np.mean(chunk_kls)) > cfg.target_kl:
+                    stop_early = True
+                    break
+            if stop_early:
+                break
+        return self._mean_stats(stats)
+
+    def _optimize_batch(self, logp, ent, value, old_logp, adv, target):
+        cfg = self.cfg
+        ratio = (logp - old_logp).exp()
+        pg = -torch.min(
+            ratio * adv,
+            torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv,
+        ).mean()
+        vf = 0.5 * (value - target).pow(2).mean()
+        ent_m = ent.mean()
+        loss = pg + cfg.vf_coef * vf - cfg.ent_coef * ent_m
+
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+        self.opt.step()
+
+        with torch.no_grad():
+            dlog = logp - old_logp
+            kl = ((ratio - 1) - dlog).mean()
+            clipfrac = ((ratio - 1).abs() > cfg.clip).float().mean()
+        return {
+            "pg": pg.item(),
+            "vf": vf.item(),
+            "ent": ent_m.item(),
+            "kl": kl.item(),
+            "clipfrac": clipfrac.item(),
+        }
+
+    @staticmethod
+    def _empty_update_stats():
+        return {"pg": [], "vf": [], "ent": [], "kl": [], "clipfrac": []}
+
+    @staticmethod
+    def _append_stats(stats, values):
+        for key, value in values.items():
+            stats[key].append(value)
+
+    @staticmethod
+    def _mean_stats(stats):
+        return {key: float(np.mean(values)) if values else 0.0 for key, values in stats.items()}
+
     def _publish_live(self, info, state):
         from ..monitor.publish import publish_frame
         publish_frame(self.env, self.policy, self.circuit, state, info)
@@ -284,69 +412,93 @@ class PPO:
         if not cfg.curriculum or not self._ep_stats["gates"]:
             return
         frac = float(np.mean(self._ep_stats["gates"][-100:])) / cfg.env.n_gates
-        step = cfg.curriculum_rate * (1 if frac > cfg.curriculum_target else -0.5)
+        step = cfg.curriculum_rate * (1.0 if frac > cfg.curriculum_target else -0.5)
         self.env.cfg.difficulty = float(np.clip(self.env.cfg.difficulty + step, 0.05, 1.0))
-        # regenerate the course pool so the new difficulty actually takes effect
         if self.updates % 10 == 0:
             self.env._pool = [self.env._new_course() for _ in range(self.env.cfg.course_pool)]
 
+    def _summary_metrics(self, stats: dict[str, float], fps: float) -> dict[str, float]:
+        ep = {
+            key: float(np.mean(values[-100:])) if values else 0.0
+            for key, values in self._ep_stats.items()
+        }
+        return {
+            "step": float(self.global_step),
+            "update": float(self.updates),
+            "fps": float(fps),
+            "ep_return": ep["return"],
+            "ep_gates": ep["gates"],
+            "ep_length": ep["length"],
+            "crash_rate": ep["crash"],
+            "difficulty": float(self.env.cfg.difficulty),
+            "policy_loss": stats["pg"],
+            "value_loss": stats["vf"],
+            "entropy": stats["ent"],
+            "kl": stats["kl"],
+            "clipfrac": stats["clipfrac"],
+            "elapsed": self.elapsed_before_resume + time.time() - self.t_start,
+        }
+
     def train(self):
         cfg = self.cfg
-        if cfg.warmstart_steps:
+        if cfg.warmstart_steps and not self._resumed:
             from .imitate import warm_start
             warm_start(self.policy, self.env, steps=cfg.warmstart_steps)
-            # the cloning optimiser is discarded; PPO starts with fresh moments
-            self.opt = torch.optim.Adam(self.policy.parameters(), lr=cfg.lr, eps=1e-5)
+            self.opt = self._new_optimizer()
+
         obs = self.env.reset()
         state = self.policy.init_state(cfg.n_envs)
 
-        while self.global_step < cfg.total_steps:
-            t0 = time.time()
-            buf, obs, state, state0, last_val = self.rollout(obs, state)
-            adv, ret = self.gae(buf, last_val)
-            stats = self.update(buf, adv, ret, state0)
-            self.updates += 1
-            self._curriculum()
+        try:
+            while self.global_step < cfg.total_steps:
+                t0 = time.time()
+                buf, obs, state, state_starts, last_val = self.rollout(obs, state)
+                adv, ret = self.gae(buf, last_val)
+                stats = self.update(buf, adv, ret, state_starts)
+                self.updates += 1
+                self._curriculum()
 
-            dt = time.time() - t0
-            fps = cfg.rollout * cfg.n_envs / dt
-            ep = {k: (float(np.mean(v[-100:])) if v else 0.0) for k, v in self._ep_stats.items()}
-            BUS.record(
-                step=self.global_step, update=self.updates, fps=fps,
-                ep_return=ep["return"], ep_gates=ep["gates"], ep_length=ep["length"],
-                crash_rate=ep["crash"], difficulty=self.env.cfg.difficulty,
-                policy_loss=stats["pg"], value_loss=stats["vf"],
-                entropy=stats["ent"], kl=stats["kl"], clipfrac=stats["clipfrac"],
-                elapsed=time.time() - self.t_start,
-            )
-            print(f"[{self.global_step:>9,}] ret {ep['return']:7.2f} | gates {ep['gates']:4.2f}"
-                  f"/{cfg.env.n_gates} | crash {ep['crash']:4.2f} | diff {self.env.cfg.difficulty:.2f}"
-                  f" | ent {stats['ent']:6.2f} | kl {stats['kl']:.4f} | {fps:6.0f} fps")
+                fps = cfg.rollout * cfg.n_envs / max(time.time() - t0, 1e-9)
+                metrics = self._summary_metrics(stats, fps)
+                self._last_metrics = metrics
+                BUS.record(**metrics)
+                print(
+                    f"[{self.global_step:>9,}] ret {metrics['ep_return']:7.2f} | "
+                    f"gates {metrics['ep_gates']:4.2f}/{cfg.env.n_gates} | "
+                    f"crash {metrics['crash_rate']:4.2f} | diff {metrics['difficulty']:.2f} | "
+                    f"ent {stats['ent']:6.2f} | kl {stats['kl']:.4f} | {fps:6.0f} fps"
+                )
 
-            if self.updates % cfg.save_every == 0:
-                self.save()
-        self.save()
+                if cfg.save_every and self.updates % cfg.save_every == 0:
+                    self.save("periodic")
+        except KeyboardInterrupt:
+            path = self.save("interrupt")
+            print(f"\n[flypv] interrupted; checkpoint saved -> {path}")
+            return self
 
-    def save(self):
-        p = self.out / "policy.pt"
-        torch.save({"policy": self.policy.state_dict(), "step": self.global_step,
-                    "cfg": _jsonable(asdict(self.cfg))}, p)
-        return p
+        path = self.save("final")
+        print(f"[flypv] training complete; checkpoint saved -> {path}")
+        return self
 
-
-def _jsonable(d):
-    if isinstance(d, dict):
-        return {k: _jsonable(v) for k, v in d.items()}
-    if isinstance(d, (list, tuple)):
-        return [_jsonable(v) for v in d]
-    if isinstance(d, np.ndarray):
-        return d.tolist()
-    if isinstance(d, (np.integer, np.floating)):
-        return d.item()
-    return d
+    def save(self, reason: str = "manual") -> Path:
+        cfg_snapshot = self.cfg.to_dict()
+        cfg_snapshot["resume"] = None
+        cfg_snapshot["reset_optimizer"] = False
+        elapsed = self.elapsed_before_resume + time.time() - self.t_start
+        return self.checkpoints.save(
+            policy=self.policy,
+            optimizer=self.opt,
+            cfg=cfg_snapshot,
+            global_step=self.global_step,
+            updates=self.updates,
+            difficulty=self.env.cfg.difficulty,
+            ep_stats=self._ep_stats,
+            metrics=self._last_metrics,
+            elapsed=elapsed,
+            reason=reason,
+        )
 
 
 def train(cfg: TrainConfig | None = None):
-    ppo = PPO(cfg or TrainConfig())
-    ppo.train()
-    return ppo
+    trainer = PPO(cfg or TrainConfig())
+    return trainer.train()

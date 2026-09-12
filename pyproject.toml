@@ -9,17 +9,13 @@ dependencies = [
     "torch>=2.4",
     "pandas>=2.2",
     "pyarrow>=16",
-    "gymnasium>=0.29",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "websockets>=12",
     "pyyaml>=6",
-    "tqdm>=4.66",
-    "rich>=13",
 ]
 
 [project.optional-dependencies]
-# Anatomically detailed MuJoCo fly body (DeepMind x Janelia). Heavier install.
+# Only needed if you later build a MuJoCo/flybody environment adapter.
 body = ["mujoco>=3.2", "dm-control>=1.0.20"]
 
 [project.scripts]

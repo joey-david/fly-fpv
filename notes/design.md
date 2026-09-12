@@ -1,80 +1,94 @@
 # Design notes
 
-Decisions that took measurement rather than judgement, and the numbers behind them.
+Implementation decisions that materially affect the experiment.
 
-## Filtering 151.8 M edges down to 535 k
+## Connectome filtering
 
-The raw `connectome-weights` table is segment-to-segment across every
-reconstruction fragment. Two filters: bodies with `status == "Traced"` (165,122
-of 211,577), and edges of at least 5 synapses — the conventional threshold below
-which automatic synapse prediction's false-discovery rate dominates. Result:
-6,235,682 connections carrying 89,731,552 synapses, 63% excitatory.
+The raw MaleCNS weights table contains segment-level reconstruction fragments.
+`loader.py` keeps traced bodies and edges with at least five predicted synapses,
+then compacts the result into a signed CSR matrix. Neurotransmitter sign belongs
+to the presynaptic neuron; unresolved/modulatory cells are handled separately by
+the policy.
 
-## Why the flight circuit is 28 k neurons and not 166 k
+## Flight-circuit extraction
 
-Forward BFS 2 hops from the flight sensors, backward BFS 2 hops from the flight
-muscles, intersect. 139,266 neurons are within two synapses of *some* sensor —
-mostly the enormous optic lobe — but only 13,633 are within two of a muscle, and
-12,891 sit on a path between the two. Adding the seeds gives 28,361. This is the
-tissue that can influence a wing inside the latency budget of a wingbeat, and it
-is consistent with the policy's four-hop settling.
+The default circuit takes the union of flight sensory/motor seeds and neurons on
+short paths between them. In the current MaleCNS cache this is about 28k neurons
+and 535k connections. The two-hop extraction is a practical sensorimotor subset,
+not a claim that all relevant biological computation must finish in four graph
+operations.
 
-## Bugs worth recording
+The policy now carries neural state across 5 ms control ticks. Four sparse graph
+iterations happen per tick by default, while temporal credit assignment is
+truncated separately (16 ticks / 80 ms by default). This removes the old,
+unnecessary coupling between graph-extraction depth and temporal memory.
 
-**Moment of inertia off by 10³.** Written as 1.16e-16 kg·m² from computing
-`(2/5) m b²` with the mass in grams. Peak aerodynamic torque of 1.5e-8 N·m then
-implies 1.3e8 rad/s² and the integrator produced NaN within one control step.
-Correct value is 1.16e-13, which puts peak within-beat angular acceleration at
-5.2e4 rad/s² — a body oscillation of a few degrees per stroke, which is what is
-measured in real flies.
+## Recorded bugs and corrections
 
-**The tanh correction applied in only one place.** `act()` returned the raw
-Gaussian log-probability while the PPO update recomputed it with the tanh
-Jacobian subtracted. Every importance ratio carried a large constant offset, and
-KL sat at 6–8 instead of 0.02. Both paths now go through `squashed_log_prob`.
+**Moment of inertia was off by 10³.** The original value mixed grams and
+kilograms. Correcting the body inertia moved angular acceleration back into a
+plausible range and stopped the integrator exploding immediately.
 
-**Textbook kinematics do not hover.** 140° amplitude, 218 Hz, 45° angle of
-attack, −15° stroke plane gives 0.95 body weights and a residual nose-up torque
-of ~2100 rad/s²; the fly tumbles in 30 ms and every episode ended in a crash
-before the agent could learn anything. `wing/trim.py` solves the three-parameter
-system instead — stroke offset, amplitude scale, stroke-plane tilt — against
-zero net force and zero pitch torque. It converges to +7.4°, 141°, 0.0°, giving
-1.0000 body weights, no drift, and passive rate damping.
+**Tanh likelihood correction was inconsistent.** Sampling and PPO likelihood
+recomputation now both use the same Jacobian-corrected log probability.
 
-**A single-stage PD tumbles executing its own command.** Attitude error up to π
-with ω_n = 70 rad/s asks for 15,000 rad/s², which crosses the tumble threshold
-in two control steps. The cascaded form — angle error sets a desired body rate,
-clamped at 35 rad/s (a real fly's saccade peak), and an inner loop drives the
-rate — took the reflex pilot from 0 gates to 2.5 of 6.
+**Time-limit truncation was treated like death.** PPO now bootstraps from the
+final observation at a pure episode timeout and only treats actual terminations
+as zero-value endpoints.
 
-**The retina eats every budget it is given.** 14,201 of the flight circuit's
-28,361 neurons are retinotopic. Both the `core` circuit pruning and the
-monitor's display sampling initially kept all afferents first and had nothing
-left for the brain. Both now subsample the eye — by whole ommatidial column, so
-the map stays coherent — and spend the rest on interneurons.
+**The nominal wing kinematics did not hover.** `wing/trim.py` solves for stroke
+offset, amplitude scale and stroke-plane tilt so zero action is a balanced trim
+rather than an immediate tumble.
 
-## Measured control authority
+**The reflex pilot initially asked for impossible angular accelerations.** It now
+uses a cascaded attitude/rate controller with bounded desired body rates.
 
-Per unit control, torque normalised by weight × wing length, force by weight:
+**The retina consumed small circuit/display budgets.** Both circuit pruning and
+the monitor explicitly reserve capacity for non-visual sensorimotor tissue.
 
-| | effect |
-|---|---|
+**The old degree-preserving baseline was not degree-preserving after sparse
+coalescing.** Independent endpoint permutations could create duplicate edges and
+could attach an inhibitory weight to a different presynaptic cell. The control
+now uses directed double-edge swaps, preserving every neuron's in/out degree and
+each source neuron's outgoing weight/sign multiset.
+
+**The aerodynamic module claimed an added-mass term that was identically zero.**
+The dead placeholder and unused wing-mass field were removed. The implemented
+plant claims only the terms it actually computes: translational lift/drag,
+rotational circulation, body drag, and the resulting torques/power.
+
+## Control authority
+
+Measured near the hover trim, per unit normalized control (torque normalized by
+weight × wing length, force by weight):
+
+| control | principal effect |
+|---|---:|
 | differential stroke amplitude | roll 0.173 |
 | collective stroke offset | pitch −0.211 |
 | differential angle of attack | yaw 0.329 |
 | collective amplitude | lift 0.760 |
 | stroke-plane tilt | thrust 0.512 |
 
-The destabilising pitch torque from flying at 0.3 m/s is 0.0215 — about a fifth
-of the collective-offset authority, so the plant is comfortably controllable.
+These coefficients seed the reflex expert; PPO is not given the inverse control
+map directly.
 
-## Throughput
+## Throughput choices
 
-| | env steps/s |
-|---|---|
-| 16 envs, naive | 412 |
-| 64 envs, after vision cadence + gate windowing + course pool | 1,811 |
+The simulator keeps several deliberately cheap operations: vectorized parallel
+environments, a pre-generated course pool, compound-eye rendering below the
+control rate, and ray-casting only nearby gates. The monitor is latest-value-wins
+and runs on a separate server thread so browser rendering cannot backpressure
+training.
 
-The three fixes: render the eye at 50 Hz rather than 200, ray-cast only the four
-gates that can be in front of the fly instead of all eight, and draw resets from
-a pre-generated pool of 256 courses rather than building one per reset.
+## Reproducibility and restart semantics
+
+A checkpoint contains policy and optimizer states, PPO counters, curriculum
+difficulty, recent episode statistics, RNG state, metrics and the resolved
+configuration. Numbered checkpoints are atomically written and tracked by
+`latest.json` and `best.json`.
+
+Resume intentionally starts new physical episodes instead of serializing the
+entire vectorized simulator. The learning process continues; the exact physical
+trajectory does not. This keeps checkpoints compact and makes the restart
+semantics explicit.
