@@ -4,6 +4,7 @@ __pycache__/
 data/raw/*.feather
 data/cache/*.npz
 data/cache/*.json
+data/cache/*.parquet
 runs/*
 !runs/.gitkeep
 .DS_Store
