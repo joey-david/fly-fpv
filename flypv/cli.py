@@ -45,6 +45,12 @@ def main(argv=None):
                    help="expert transitions per env for behaviour cloning (0 disables)")
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default="auto")
+    t.add_argument("--tbptt", type=int, default=16,
+                   help="temporal credit-assignment window in control steps (default: 16 = 80 ms)")
+    t.add_argument("--state-carry", type=float, default=1.0,
+                   help="neural state retained between control ticks (default: 1.0)")
+    t.add_argument("--stateless", action="store_true",
+                   help="ablation: reset connectome state every control step")
 
     m = sub.add_parser("monitor", help="serve the dashboard on its own")
     m.add_argument("--port", type=int, default=8777)
@@ -87,6 +93,7 @@ def main(argv=None):
             lr=a.lr, n_iters=a.iters, learn_synapses=a.learn_synapses,
             monitor=not a.no_monitor, run_name=a.run, seed=a.seed, device=a.device,
             warmstart_steps=a.warmstart,
+            recurrent=not a.stateless, tbptt_steps=a.tbptt, state_carry=a.state_carry,
             env=EnvConfig(n_envs=a.envs, n_gates=a.gates, vision=not a.no_vision,
                           seed=a.seed),
         )
