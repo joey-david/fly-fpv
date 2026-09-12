@@ -2,12 +2,12 @@
 
 The headline number for MaleCNS v1.0 is "166,000 neurons", but the raw
 `connectome-weights` table has 151.8 M rows because it is segment-to-segment,
-including every unproofread fragment.  Training on that unfiltered is training
-on reconstruction noise.  We filter twice:
+including every unproofread fragment. Training on that unfiltered is training
+on reconstruction noise. We filter twice:
 
   1. **Bodies** — keep proofread neurons (`status == "Traced"`), drop glia and
      orphan fragments.
-  2. **Edges** — keep connections at or above `min_synapses` (default 5).  This
+  2. **Edges** — keep connections at or above `min_synapses` (default 5). This
      is the conventional connectome-analysis threshold: below it the false
      discovery rate from automatic synapse prediction dominates.
 
@@ -175,20 +175,63 @@ def _load_nt(body_ids: np.ndarray) -> np.ndarray:
     return nt.map(lambda s: NT_SIGN.get(str(s).lower(), 0.0)).to_numpy(dtype=np.float32)
 
 
+def _repair_metadata_sidecar(cache_path: Path, verbose: bool = True) -> bool:
+    """Recreate a missing metadata parquet from the raw annotation table.
+
+    The sparse cache stores the exact body-id ordering, so rebuilding this sidecar
+    does not require rescanning the 151.8 M-edge weights table.
+    """
+    meta_path = cache_path.with_suffix(".meta.parquet")
+    if not cache_path.exists() or meta_path.exists() or not have("annotations"):
+        return False
+
+    if verbose:
+        print(f"[connectome] cache metadata missing; repairing {meta_path.name} ...")
+    with np.load(cache_path, allow_pickle=False) as z:
+        body_ids = z["body_ids"].astype(np.int64, copy=False)
+
+    ann = _load_annotations().set_index("bodyId", drop=False)
+    missing = np.setdiff1d(body_ids, ann.index.to_numpy(dtype=np.int64), assume_unique=False)
+    if len(missing):
+        if verbose:
+            print(f"[connectome] cannot repair metadata: {len(missing):,} cached bodies are absent from annotations")
+        return False
+
+    meta = ann.loc[body_ids].reset_index(drop=True)
+    meta.to_parquet(meta_path)
+    if verbose:
+        print(f"[connectome] repaired -> {meta_path.name}")
+    return True
+
+
 def load_connectome(
     min_synapses: int = 5,
     statuses: tuple[str, ...] = ("Traced",),
     require_type: bool = False,
     cache: bool = True,
     verbose: bool = True,
+    force_rebuild: bool = False,
 ) -> Connectome:
     """Build (or load from cache) the filtered whole-CNS connectome."""
     tag = f"malecns-v1.0-syn{min_synapses}-{'typed' if require_type else 'all'}"
     cache_path = DATA_CACHE / f"{tag}.npz"
-    if cache and cache_path.exists():
-        if verbose:
-            print(f"[connectome] cache hit -> {cache_path.name}")
-        return Connectome.load(cache_path)
+    meta_path = cache_path.with_suffix(".meta.parquet")
+
+    if cache and not force_rebuild and cache_path.exists():
+        if not meta_path.exists():
+            _repair_metadata_sidecar(cache_path, verbose=verbose)
+        if meta_path.exists():
+            if verbose:
+                print(f"[connectome] cache hit -> {cache_path.name}")
+            try:
+                return Connectome.load(cache_path)
+            except (OSError, ValueError, EOFError, KeyError) as exc:
+                if verbose:
+                    print(f"[connectome] cache is invalid ({exc}); rebuilding")
+        elif verbose:
+            print("[connectome] incomplete cache; rebuilding from raw data")
+    elif cache and force_rebuild and verbose:
+        print(f"[connectome] forcing rebuild of {cache_path.name}")
 
     for k in ("annotations", "neurotransmitters", "weights"):
         if not have(k):
