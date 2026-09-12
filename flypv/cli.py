@@ -190,7 +190,10 @@ def main(argv=None):
 
     c = sub.add_parser("circuit", help="describe the extracted flight circuit")
     c.add_argument("--scale", default="flight", choices=["full", "flight", "core"])
-    c.add_argument("--hops", type=int, default=2)
+    c.add_argument("--hops", type=int, default=3,
+                   help="sensor/motor graph radius (default: 3 each way)")
+    c.add_argument("--closure-hops", type=int, default=1,
+                   help="layers of locally recurrent side loops to retain")
     c.add_argument("--max-neurons", type=int, default=None)
 
     t = sub.add_parser("train", help="train the fly")
@@ -222,7 +225,12 @@ def main(argv=None):
 
         if a.cmd == "circuit":
             from .connectome import build_flight_circuit
-            build_flight_circuit(scale=a.scale, hops=a.hops, max_neurons=a.max_neurons)
+            build_flight_circuit(
+                scale=a.scale,
+                hops=a.hops,
+                recurrent_closure_hops=a.closure_hops,
+                max_neurons=a.max_neurons,
+            )
             return 0
 
         if a.cmd == "runs":

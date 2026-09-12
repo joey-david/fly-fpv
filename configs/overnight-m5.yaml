@@ -25,6 +25,10 @@ warmstart_steps: 400
 
 arch: connectome
 scale: flight
+# The default flight extractor is now a 3+3-hop corridor plus one recurrent
+# closure layer. Cap only if that broader anatomical candidate exceeds what a
+# 16 GB laptop should carry comfortably through TBPTT.
+max_neurons: 50000
 
 # Difficulty never decreases. A level advances only after the recent policy:
 #   - clears >=92% of gates,
