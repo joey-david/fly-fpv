@@ -1,13 +1,6 @@
-"""PPO for the connectome policy, with persistent neural state and TBPTT.
-
-The default model carries the connectome's neural state across 5 ms control
-steps. During optimization, gradients are replayed through short temporal
-chunks and truncated at chunk boundaries; the state itself is not reset there.
-Use ``recurrent=False`` only as the explicit stateless ablation.
-"""
+"""Plain feed-forward PPO for connectome-constrained flight policies."""
 from __future__ import annotations
 
-import math
 import time
 from pathlib import Path
 
@@ -39,9 +32,6 @@ def pick_device(pref: str = "auto") -> str:
 class PPO:
     def __init__(self, cfg: TrainConfig):
         cfg.validate()
-        if cfg.arch == "mlp" and cfg.recurrent:
-            print("[flypv] MLP baseline is feed-forward; disabling recurrent/TBPTT mode")
-            cfg.recurrent = False
         self.cfg = cfg
         self.device = pick_device(cfg.device)
         torch.manual_seed(cfg.seed)
@@ -88,11 +78,7 @@ class PPO:
 
     def _build_policy(self):
         cfg = self.cfg
-        pc = PolicyConfig(
-            n_iters=cfg.n_iters,
-            carry=cfg.state_carry if cfg.recurrent else 0.0,
-            learn_synapses=cfg.learn_synapses,
-        )
+        pc = PolicyConfig(n_iters=cfg.n_iters, learn_synapses=cfg.learn_synapses)
         if cfg.arch == "connectome":
             return ConnectomePolicy(
                 self.circuit, self.env.PROPRIO_DIM, self.env.action_dim, pc, self.device
@@ -149,7 +135,6 @@ class PPO:
             f"[flypv] resumed {path.name} at step {self.global_step:,}, "
             f"update {self.updates:,}, difficulty {self.env.cfg.difficulty:.2f}"
         )
-        print("[flypv] physical environments restart fresh; policy/optimizer/curriculum continue")
 
     def _to_torch(self, obs: dict) -> dict:
         return {k: torch.from_numpy(v).to(self.device) for k, v in obs.items()}
@@ -172,30 +157,23 @@ class PPO:
         return buf
 
     @torch.no_grad()
-    def rollout(self, obs: dict, state: torch.Tensor):
+    def rollout(self, obs: dict):
         cfg = self.cfg
         T, E = cfg.rollout, cfg.n_envs
         buf = self._empty_buffer(obs)
-
-        if cfg.recurrent:
-            n_chunks = math.ceil(T / cfg.tbptt_steps)
-            state_starts = torch.empty(
-                (n_chunks, *state.shape), dtype=state.dtype, device="cpu"
-            )
-        else:
-            state_starts = None
+        last_h = self.policy.init_state(E)
 
         for t in range(T):
-            if cfg.recurrent and t % cfg.tbptt_steps == 0:
-                state_starts[t // cfg.tbptt_steps].copy_(state.detach().cpu())
-
             to = self._to_torch(obs)
             buf["proprio"][t] = to["proprio"]
             if "on" in buf:
                 buf["on"][t] = to["on"]
                 buf["off"][t] = to["off"]
 
-            action, logp, value, state, raw = self.policy.act(to, state)
+            # Every decision is independent. The connectome is unrolled only
+            # inside this forward pass; no neural state is carried across steps.
+            state0 = self.policy.init_state(E)
+            action, logp, value, last_h, raw = self.policy.act(to, state0)
             obs, rew, term, trunc, info = self.env.step(action.cpu().numpy())
             done = term | trunc
 
@@ -213,22 +191,22 @@ class PPO:
                     k: torch.from_numpy(v[ids_np]).to(self.device)
                     for k, v in info["final_obs"].items()
                 }
-                final_state = state.index_select(1, ids)
-                _, _, final_value, _ = self.policy.forward(final_obs, final_state)
+                _, _, final_value, _ = self.policy.forward(
+                    final_obs, self.policy.init_state(len(ids_np))
+                )
                 buf["timeout_value"][t].index_copy_(0, ids, final_value)
 
             if done.any():
-                state = state.clone()
-                mask = torch.from_numpy(done).to(state.device)
-                state[:, mask] = 0.0
                 self._log_episodes(info, done)
 
             self.global_step += E
             if cfg.monitor and t % 8 == 0:
-                self._publish_live(info, state)
+                self._publish_live(info, last_h)
 
-        _, _, last_val, _ = self.policy.forward(self._to_torch(obs), state)
-        return buf, obs, state, state_starts, last_val
+        _, _, last_val, _ = self.policy.forward(
+            self._to_torch(obs), self.policy.init_state(E)
+        )
+        return buf, obs, last_h, last_val
 
     def _log_episodes(self, info, done):
         ids = np.flatnonzero(done)
@@ -242,11 +220,10 @@ class PPO:
 
     def gae(self, buf, last_val):
         cfg = self.cfg
-        T = cfg.rollout
         adv = torch.zeros_like(buf["rew"])
         gae = torch.zeros(cfg.n_envs, device=self.device)
-        for t in reversed(range(T)):
-            nextval = last_val if t == T - 1 else buf["val"][t + 1]
+        for t in reversed(range(cfg.rollout)):
+            nextval = last_val if t == cfg.rollout - 1 else buf["val"][t + 1]
             nonterm = 1.0 - buf["done"][t]
             delta = (
                 buf["rew"][t]
@@ -263,12 +240,7 @@ class PPO:
         dist = torch.distributions.Normal(mean, log_std.exp())
         return squashed_log_prob(dist, raw), dist.entropy().sum(-1)
 
-    def update(self, buf, adv, ret, state_starts):
-        if self.cfg.recurrent:
-            return self._update_recurrent(buf, adv, ret, state_starts)
-        return self._update_stateless(buf, adv, ret)
-
-    def _update_stateless(self, buf, adv, ret):
+    def update(self, buf, adv, ret):
         cfg = self.cfg
         T, E = cfg.rollout, cfg.n_envs
 
@@ -287,13 +259,14 @@ class PPO:
             np.random.shuffle(order)
             epoch_kls = []
             for start in range(0, n, mb):
-                idx = torch.from_numpy(order[start : start + mb]).to(self.device)
-                obs = {"proprio": b["proprio"][idx]}
+                idx = torch.from_numpy(order[start:start + mb]).to(self.device)
+                batch_obs = {"proprio": b["proprio"][idx]}
                 if "on" in b:
-                    obs["on"] = b["on"][idx]
-                    obs["off"] = b["off"][idx]
-                state = self.policy.init_state(len(idx))
-                mean, log_std, value, _ = self.policy.forward(obs, state)
+                    batch_obs["on"] = b["on"][idx]
+                    batch_obs["off"] = b["off"][idx]
+                mean, log_std, value, _ = self.policy.forward(
+                    batch_obs, self.policy.init_state(len(idx))
+                )
                 logp, ent = self._logp(mean, log_std, b["raw"][idx])
                 batch_stats = self._optimize_batch(
                     logp, ent, value, b["logp"][idx], b_adv[idx], b_ret[idx]
@@ -301,64 +274,6 @@ class PPO:
                 self._append_stats(stats, batch_stats)
                 epoch_kls.append(batch_stats["kl"])
             if epoch_kls and float(np.mean(epoch_kls)) > cfg.target_kl:
-                break
-        return self._mean_stats(stats)
-
-    def _update_recurrent(self, buf, adv, ret, state_starts):
-        cfg = self.cfg
-        T, E, K = cfg.rollout, cfg.n_envs, cfg.tbptt_steps
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-        target_samples = max(1, (T * E) // cfg.minibatches)
-        env_batch = max(1, min(E, math.ceil(target_samples / K)))
-        n_chunks = math.ceil(T / K)
-        stats = self._empty_update_stats()
-
-        for _ in range(cfg.epochs):
-            stop_early = False
-            for ci in np.random.permutation(n_chunks):
-                t0, t1 = ci * K, min((ci + 1) * K, T)
-                chunk_kls = []
-                env_order = np.random.permutation(E)
-                for start in range(0, E, env_batch):
-                    env_np = env_order[start : start + env_batch]
-                    env_cpu = torch.from_numpy(env_np.astype(np.int64))
-                    env_idx = env_cpu.to(self.device)
-                    state = state_starts[ci].index_select(1, env_cpu).to(self.device).detach()
-
-                    logps, ents, values = [], [], []
-                    old_logps, advs, targets = [], [], []
-                    for t in range(t0, t1):
-                        obs = {"proprio": buf["proprio"][t].index_select(0, env_idx)}
-                        if "on" in buf:
-                            obs["on"] = buf["on"][t].index_select(0, env_idx)
-                            obs["off"] = buf["off"][t].index_select(0, env_idx)
-                        mean, log_std, value, state = self.policy.forward(obs, state)
-                        raw = buf["raw"][t].index_select(0, env_idx)
-                        logp, ent = self._logp(mean, log_std, raw)
-                        logps.append(logp)
-                        ents.append(ent)
-                        values.append(value)
-                        old_logps.append(buf["logp"][t].index_select(0, env_idx))
-                        advs.append(adv[t].index_select(0, env_idx))
-                        targets.append(ret[t].index_select(0, env_idx))
-                        alive = 1.0 - buf["done"][t].index_select(0, env_idx)
-                        state = state * alive.unsqueeze(0)
-
-                    batch_stats = self._optimize_batch(
-                        torch.stack(logps),
-                        torch.stack(ents),
-                        torch.stack(values),
-                        torch.stack(old_logps),
-                        torch.stack(advs),
-                        torch.stack(targets),
-                    )
-                    self._append_stats(stats, batch_stats)
-                    chunk_kls.append(batch_stats["kl"])
-
-                if chunk_kls and float(np.mean(chunk_kls)) > cfg.target_kl:
-                    stop_early = True
-                    break
-            if stop_early:
                 break
         return self._mean_stats(stats)
 
@@ -382,13 +297,8 @@ class PPO:
             dlog = logp - old_logp
             kl = ((ratio - 1) - dlog).mean()
             clipfrac = ((ratio - 1).abs() > cfg.clip).float().mean()
-        return {
-            "pg": pg.item(),
-            "vf": vf.item(),
-            "ent": ent_m.item(),
-            "kl": kl.item(),
-            "clipfrac": clipfrac.item(),
-        }
+        return {"pg": pg.item(), "vf": vf.item(), "ent": ent_m.item(),
+                "kl": kl.item(), "clipfrac": clipfrac.item()}
 
     @staticmethod
     def _empty_update_stats():
@@ -418,24 +328,14 @@ class PPO:
             self.env._pool = [self.env._new_course() for _ in range(self.env.cfg.course_pool)]
 
     def _summary_metrics(self, stats: dict[str, float], fps: float) -> dict[str, float]:
-        ep = {
-            key: float(np.mean(values[-100:])) if values else 0.0
-            for key, values in self._ep_stats.items()
-        }
+        ep = {key: float(np.mean(values[-100:])) if values else 0.0
+              for key, values in self._ep_stats.items()}
         return {
-            "step": float(self.global_step),
-            "update": float(self.updates),
-            "fps": float(fps),
-            "ep_return": ep["return"],
-            "ep_gates": ep["gates"],
-            "ep_length": ep["length"],
-            "crash_rate": ep["crash"],
-            "difficulty": float(self.env.cfg.difficulty),
-            "policy_loss": stats["pg"],
-            "value_loss": stats["vf"],
-            "entropy": stats["ent"],
-            "kl": stats["kl"],
-            "clipfrac": stats["clipfrac"],
+            "step": float(self.global_step), "update": float(self.updates), "fps": float(fps),
+            "ep_return": ep["return"], "ep_gates": ep["gates"], "ep_length": ep["length"],
+            "crash_rate": ep["crash"], "difficulty": float(self.env.cfg.difficulty),
+            "policy_loss": stats["pg"], "value_loss": stats["vf"], "entropy": stats["ent"],
+            "kl": stats["kl"], "clipfrac": stats["clipfrac"],
             "elapsed": self.elapsed_before_resume + time.time() - self.t_start,
         }
 
@@ -447,14 +347,12 @@ class PPO:
             self.opt = self._new_optimizer()
 
         obs = self.env.reset()
-        state = self.policy.init_state(cfg.n_envs)
-
         try:
             while self.global_step < cfg.total_steps:
                 t0 = time.time()
-                buf, obs, state, state_starts, last_val = self.rollout(obs, state)
+                buf, obs, _, last_val = self.rollout(obs)
                 adv, ret = self.gae(buf, last_val)
-                stats = self.update(buf, adv, ret, state_starts)
+                stats = self.update(buf, adv, ret)
                 self.updates += 1
                 self._curriculum()
 
@@ -468,7 +366,6 @@ class PPO:
                     f"crash {metrics['crash_rate']:4.2f} | diff {metrics['difficulty']:.2f} | "
                     f"ent {stats['ent']:6.2f} | kl {stats['kl']:.4f} | {fps:6.0f} fps"
                 )
-
                 if cfg.save_every and self.updates % cfg.save_every == 0:
                     self.save("periodic")
         except KeyboardInterrupt:
@@ -486,16 +383,10 @@ class PPO:
         cfg_snapshot["reset_optimizer"] = False
         elapsed = self.elapsed_before_resume + time.time() - self.t_start
         return self.checkpoints.save(
-            policy=self.policy,
-            optimizer=self.opt,
-            cfg=cfg_snapshot,
-            global_step=self.global_step,
-            updates=self.updates,
-            difficulty=self.env.cfg.difficulty,
-            ep_stats=self._ep_stats,
-            metrics=self._last_metrics,
-            elapsed=elapsed,
-            reason=reason,
+            policy=self.policy, optimizer=self.opt, cfg=cfg_snapshot,
+            global_step=self.global_step, updates=self.updates,
+            difficulty=self.env.cfg.difficulty, ep_stats=self._ep_stats,
+            metrics=self._last_metrics, elapsed=elapsed, reason=reason,
         )
 
 
