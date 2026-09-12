@@ -1,5 +1,5 @@
 """Training entry points."""
 from .config import TrainConfig
-from .ppo import PPO, train
+from .curriculum import PPO, train
 
 __all__ = ["PPO", "TrainConfig", "train"]
