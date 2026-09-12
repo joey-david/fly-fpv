@@ -4,6 +4,6 @@ __pycache__/
 data/raw/*.feather
 data/cache/*.npz
 data/cache/*.json
-runs/*/
+runs/*
 !runs/.gitkeep
 .DS_Store
