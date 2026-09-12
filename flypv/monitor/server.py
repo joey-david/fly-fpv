@@ -1,8 +1,8 @@
 """FastAPI + websocket server for the training monitor.
 
-Runs in a daemon thread inside the trainer process so it can read the bus with
-no IPC. The socket pushes at a fixed frame rate and always sends the *latest*
-state, never a queue — if the browser stalls, it catches up by skipping.
+The monitor is intentionally lossy: clients receive the newest state available,
+never a queue. Live updates are sent as channel deltas so a cheap flight-pose
+update does not resend a large unchanged neural-activity frame.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from .bus import BUS
 
 WEB = Path(__file__).parent / "web"
+WS_HZ = 30.0
 
 
 def make_app() -> FastAPI:
@@ -38,14 +39,14 @@ def make_app() -> FastAPI:
     async def ws(sock: WebSocket):
         await sock.accept()
         await sock.send_json({"kind": "static", **BUS.static()})
-        last = -1
+        last = 0
         try:
             while True:
-                snap = BUS.snapshot()
+                snap = BUS.snapshot(since=last)
                 if snap["seq"] != last:
                     last = snap["seq"]
                     await sock.send_json({"kind": "frame", **snap})
-                await asyncio.sleep(1 / 20)
+                await asyncio.sleep(1.0 / WS_HZ)
         except (WebSocketDisconnect, RuntimeError):
             return
 
@@ -60,7 +61,7 @@ def serve(host: str = "127.0.0.1", port: int = 8777, log_level: str = "warning")
 
 
 def serve_background(host: str = "127.0.0.1", port: int = 8777) -> threading.Thread:
-    t = threading.Thread(target=serve, args=(host, port), daemon=True)
-    t.start()
+    thread = threading.Thread(target=serve, args=(host, port), daemon=True)
+    thread.start()
     print(f"[flypv] monitor -> http://{host}:{port}")
-    return t
+    return thread
