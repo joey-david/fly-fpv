@@ -34,9 +34,15 @@ WING_CONTROLS: list[str] = [
 ]
 N_WING_CONTROLS = len(WING_CONTROLS)
 
-# Physiological travel of each control away from hover trim.
+# Physiological travel of each control away from hover trim.  Sustained wild-type
+# D. melanogaster flight is typically ~170--220 Hz.  The old +-22% frequency
+# range let a 218 Hz fly sit at 266 Hz indefinitely and, combined with maximum
+# stroke amplitude, the quasi-steady model could produce ~2.7 body weights of
+# beat-averaged force.  Restricting frequency to +-8% gives ~201--235 Hz and a
+# maximum symmetric force envelope of about 2.1 body weights, matching measured
+# short-burst free-flight capacity while retaining a little headroom above hover.
 _SCALE = np.array([
-    0.22,                    # freq: +-22% of 218 Hz
+    0.08,                    # freq: +-8% of 218 Hz -> ~201--235 Hz
     0.35, 0.35,              # amplitude: +-35% of 140 deg
     0.40, 0.40,              # stroke offset: +-0.40 rad
     0.30, 0.30,              # deviation amplitude: +-0.30 rad

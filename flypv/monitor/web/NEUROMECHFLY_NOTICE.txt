@@ -1,0 +1,24 @@
+NeuroMechFly v2 geometry
+========================
+
+The live monitor loads simplified NeuroMechFly v2 mesh geometry at runtime from
+flyplotlib's pinned mirror:
+
+  https://github.com/tkclam/flyplotlib
+  ref: 6801e03af8f6422524ff60d4c1c2b9a134f730d6
+  path: src/flyplotlib/data/neuromechfly/
+
+Those meshes and their rigging metadata originate from FlyGym / NeuroMechFly v2:
+
+  https://github.com/NeLy-EPFL/flygym
+  Wang-Chen et al. (2024), NeuroMechFly v2, Nature Methods
+  https://doi.org/10.1038/s41592-024-02497-y
+
+FlyGym and the NeuroMechFly assets are distributed under the Apache License,
+Version 2.0. flyplotlib's accompanying NOTICE identifies its vendored assets as
+FlyGym-derived and subject to the same license and attribution requirements.
+
+flypv does not redistribute the STL files: the browser fetches the pinned source
+assets and reduces them to display point clouds in memory. The wing planform is
+then reposed using flypv's simulated stroke, deviation, angle of attack, and
+stroke-plane tilt rather than using a canned animation.

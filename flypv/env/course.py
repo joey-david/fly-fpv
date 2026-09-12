@@ -1,9 +1,8 @@
 """Procedural 3D hoop courses in SI units.
 
-The default geometry is deliberately generous enough for early RL: 10 cm clear
-radius, 2 cm ring thickness, and 46–66 cm spacing before the difficulty scalar
-shrinks gates and increases turns/climbs. These numbers are task parameters,
-not claims about a uniquely biologically natural racing course.
+Early courses use large gates and gentle turns.  Difficulty is monotonic and can
+shrink the clear aperture from 13.5 cm to 2.5 cm while increasing turn/climb
+sharpness.  These are task parameters, not biological constants.
 """
 from __future__ import annotations
 
@@ -15,6 +14,7 @@ import numpy as np
 @dataclass
 class GateSpec:
     r_in: float = 0.1
+    r_in_min: float = 0.025
     ring_thickness: float = 0.02
     spacing: tuple[float, float] = (0.46, 0.66)
     turn: float = 0.9
@@ -59,14 +59,18 @@ def make_course(
 ) -> Course:
     """Generate a smooth random course.
 
-    ``difficulty`` in [0, 1] scales turn/climb sharpness and gate radius.
+    ``difficulty`` in [0, 1] increases turn/climb sharpness and continuously
+    shrinks the gate aperture.  The easing curve keeps the first part of the
+    curriculum forgiving but makes the final levels substantially harder.
     """
     spec = spec or GateSpec()
     rng = np.random.default_rng(seed)
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
 
     turn = spec.turn * (0.25 + 0.75 * difficulty)
     climb = spec.climb * (0.25 + 0.75 * difficulty)
-    r_in = spec.r_in * (1.35 - 0.55 * difficulty)
+    easy_radius = 1.35 * spec.r_in
+    r_in = spec.r_in_min + (easy_radius - spec.r_in_min) * (1.0 - difficulty**1.15)
 
     pos = np.array([0.0, 0.0, 0.30])
     heading = 0.0
