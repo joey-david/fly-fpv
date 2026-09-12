@@ -1,58 +1,77 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>flypv monitor</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/dashboard.css">
 
-<header class="bar">
-  <div class="ident">
-    <span class="mark" aria-hidden="true"></span>
-    <h1>flypv</h1>
-    <p id="dataset">waiting for the trainer</p>
+<header class="topbar">
+  <div class="brand">
+    <span class="pulse" aria-hidden="true"></span>
+    <div>
+      <h1>flypv</h1>
+      <p id="dataset">waiting for trainer</p>
+    </div>
   </div>
   <dl class="counters" id="counters"></dl>
-  <div class="conn" id="conn"><i></i>offline</div>
+  <div class="conn" id="conn"><i></i><span>offline</span></div>
 </header>
 
-<main>
-  <section class="stage" id="stage">
+<main class="dashboard">
+  <section class="panel flight-panel">
     <div class="panel-head">
-      <h2>Central nervous system</h2>
-      <p id="graph-note">Drag to rotate. Brain at the top, nerve cord below; every dot is a neuron at its own soma position.</p>
+      <div>
+        <h2>Third-person flight</h2>
+        <p id="flight-note">world-space chase camera · simulated body and wing kinematics</p>
+      </div>
+      <div class="telemetry" id="flight-telemetry"></div>
     </div>
-    <div class="stage-canvas"><canvas id="graph"></canvas><div id="tip" hidden></div></div>
+    <canvas id="flight"></canvas>
+  </section>
+
+  <section class="panel connectome-panel">
+    <div class="panel-head">
+      <div>
+        <h2>MaleCNS flight circuit</h2>
+        <p id="graph-note">drag to rotate · neural activity over anatomical soma coordinates</p>
+      </div>
+    </div>
+    <div class="graph-wrap">
+      <canvas id="graph"></canvas>
+      <div id="tip" hidden></div>
+    </div>
     <ul class="key" id="key"></ul>
   </section>
 
-  <aside class="rail">
-    <section class="panel">
-      <div class="panel-head"><h2>What the fly sees</h2>
-        <p>Left and right eye, one cell per ommatidium.</p></div>
-      <canvas id="eye"></canvas>
-      <p class="caption">Rows: raw luminance, then the ON and OFF channels the
-        lamina splits it into at the first synapse. Left eye on the left.</p>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head"><h2>Course</h2><p id="course-note">gate 0</p></div>
-      <canvas id="course"></canvas>
-    </section>
-  </aside>
-
-  <section class="panel wide">
-    <div class="panel-head"><h2>Wingbeat</h2><p id="wing-note"></p></div>
-    <canvas id="wing"></canvas>
+  <section class="panel eye-panel">
+    <div class="panel-head">
+      <div>
+        <h2>Through the fly's eyes</h2>
+        <p>connectome-derived ommatidial lattice · luminance / ON / OFF</p>
+      </div>
+    </div>
+    <canvas id="eye"></canvas>
   </section>
 
-  <section class="panel">
-    <div class="panel-head"><h2>Flight muscles</h2><p>Mean firing rate per motor pool.</p></div>
+  <section class="panel dynamics-panel">
+    <div class="panel-head">
+      <div>
+        <h2>Flight muscles & wingbeat</h2>
+        <p id="wing-note">instantaneous steering output and two-stroke scope</p>
+      </div>
+    </div>
+    <canvas id="wing"></canvas>
     <div class="bars" id="motor"></div>
   </section>
 
-  <section class="panel wide2">
-    <div class="panel-head"><h2>Learning</h2><p id="curve-note"></p></div>
+  <section class="panel learning-panel">
+    <div class="panel-head">
+      <div>
+        <h2>Learning</h2>
+        <p id="curve-note"></p>
+      </div>
+      <ul class="legend" id="curve-key"></ul>
+    </div>
     <canvas id="curves"></canvas>
-    <ul class="legend" id="curve-key"></ul>
   </section>
 </main>
 
-<script src="/static/app.js"></script>
+<script src="/static/dashboard.js"></script>
