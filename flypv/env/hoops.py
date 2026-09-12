@@ -38,7 +38,7 @@ class EnvConfig:
     aero_substeps: int = 12
     episode_seconds: float = 6.0
     difficulty: float = 0.4
-    vision_every: int = 2          # render the eye every N control steps (50 Hz)
+    vision_every: int = 2          # render the eye every N control steps (100 Hz)
     visible_gates: int = 4         # only ray-cast the gates that can be in front of you
     course_pool: int = 256         # pre-generated courses to resample on reset
     arena_radius: float = 3.0
