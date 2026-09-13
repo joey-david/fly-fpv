@@ -73,7 +73,8 @@ def evaluate_policy(policy, env, episodes: int | None = None) -> dict[str, float
     def act(obs):
         o = {k: torch.from_numpy(v).float().to(policy.device) for k, v in obs.items()}
         with torch.no_grad():
-            action, _, _, _ = policy.act(o, deterministic=True)
+            state = policy.init_state(len(next(iter(o.values()))))
+            action, _, _, _ = policy.act(o, state, deterministic=True)
         return action.cpu().numpy()
 
     return _episode_stats(env, act, target)
@@ -108,7 +109,8 @@ def warm_start(policy, env, steps: int = 800, epochs: int = 10, batch: int = 512
             j_cpu = torch.from_numpy(idx[s:s + batch])
             o = {k: v.index_select(0, j_cpu).to(device) for k, v in obs.items()}
             target = expert.index_select(0, j_cpu).to(device)
-            mean, _, _, _ = policy.forward(o)
+            state = policy.init_state(len(j_cpu))
+            mean, _, _, _ = policy.forward(o, state)
             loss = F.mse_loss(torch.tanh(mean), target)
             opt.zero_grad(set_to_none=True)
             loss.backward()
