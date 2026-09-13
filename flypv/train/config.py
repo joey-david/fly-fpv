@@ -28,10 +28,7 @@ class TrainConfig:
     max_grad_norm: float = 0.75
     target_kl: float = 0.03
 
-    # connectome dynamics
-    recurrent: bool = True
-    tbptt_steps: int = 16
-    state_carry: float = 1.0
+    # connectome policy
     n_iters: int = 4
     learn_synapses: bool = False
     warmstart_steps: int = 400
@@ -76,10 +73,6 @@ class TrainConfig:
             raise ValueError("gae_lambda must be in [0, 1]")
         if not 0.0 < self.clip < 1.0:
             raise ValueError("clip must be in (0, 1)")
-        if self.tbptt_steps < 1:
-            raise ValueError("tbptt_steps must be >= 1")
-        if not 0.0 <= self.state_carry <= 1.0:
-            raise ValueError("state_carry must be in [0, 1]")
         if self.n_iters < 1:
             raise ValueError("n_iters must be >= 1")
         if self.max_neurons is not None and self.max_neurons < 1:
@@ -111,7 +104,10 @@ class TrainConfig:
         if not isinstance(data, dict):
             raise TypeError("training config must be a mapping")
         data = dict(data)
-        data.pop("monitor_every", None)
+        # Legacy recurrent configs/checkpoints remain loadable; temporal-state
+        # controls are intentionally ignored by the stateless policy.
+        for legacy in ("monitor_every", "recurrent", "tbptt_steps", "state_carry"):
+            data.pop(legacy, None)
         known = {f.name for f in fields(cls)}
         unknown = set(data) - known
         if unknown:
@@ -153,7 +149,6 @@ def save_yaml(cfg: TrainConfig, path: str | Path) -> None:
 
 
 def merge_config(base: TrainConfig, overrides: dict[str, Any]) -> TrainConfig:
-    """Return a validated config with a flat set of top-level/env overrides."""
     data = base.to_dict()
     overrides = dict(overrides)
     env_overrides = overrides.pop("env", None)

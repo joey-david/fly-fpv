@@ -56,7 +56,6 @@ def _layout(circuit) -> np.ndarray:
 
 
 def display_index(circuit, budget: int = 14000) -> np.ndarray:
-    """Sample a display set without letting the retina consume the whole budget."""
     global _DISPLAY
     if _DISPLAY is not None:
         return _DISPLAY
@@ -72,20 +71,16 @@ def display_index(circuit, budget: int = 14000) -> np.ndarray:
     for name, rows in circuit.afferent.items():
         if name != "retina":
             keep.update(int(i) for i in rows)
-    keep.update(
-        np.flatnonzero(
-            np.isin(sc, ["descending_neuron", "ascending_neuron", "sensory_ascending"])
-        ).tolist()
-    )
+    keep.update(np.flatnonzero(
+        np.isin(sc, ["descending_neuron", "ascending_neuron", "sensory_ascending"])
+    ).tolist())
 
     retina = circuit.afferent.get("retina", np.array([], np.int64))
     if len(retina):
         pick = rng.choice(retina, size=min(int(0.30 * budget), len(retina)), replace=False)
         keep.update(int(i) for i in pick)
 
-    spoken_for = np.union1d(
-        np.array(sorted(keep), dtype=np.int64), np.asarray(retina, dtype=np.int64)
-    )
+    spoken_for = np.union1d(np.array(sorted(keep), dtype=np.int64), np.asarray(retina, dtype=np.int64))
     rest = np.setdiff1d(np.arange(circuit.n), spoken_for)
     room = max(budget - len(keep), 0)
     if room and len(rest):
@@ -115,19 +110,13 @@ def publish_static(circuit, env, policy, cfg):
     hy = np.array([(3**0.5 / 2) * h2 for _, h2, _ in columns], dtype=np.float32)
     hside = np.array([1 if side == "R" else 0 for _, _, side in columns], dtype=np.uint8)
 
-    BUS.set_static(
-        "graph",
-        dict(
-            n=int(len(idx)),
-            x=np.round(xyz[:, 0], 1).tolist(),
-            y=np.round(xyz[:, 1], 1).tolist(),
-            z=np.round(xyz[:, 2], 1).tolist(),
-            role=role.tolist(),
-            edges=edges.ravel().tolist(),
-            edge_sign=(weights[order] > 0).astype(np.uint8).tolist(),
-            types=[t or sc for t, sc in zip(meta["type"], meta["superclass"])],
-        ),
-    )
+    BUS.set_static("graph", dict(
+        n=int(len(idx)), x=np.round(xyz[:, 0], 1).tolist(),
+        y=np.round(xyz[:, 1], 1).tolist(), z=np.round(xyz[:, 2], 1).tolist(),
+        role=role.tolist(), edges=edges.ravel().tolist(),
+        edge_sign=(weights[order] > 0).astype(np.uint8).tolist(),
+        types=[t or sc for t, sc in zip(meta["type"], meta["superclass"])],
+    ))
     BUS.set_static("eye", dict(x=hx.tolist(), y=hy.tolist(), side=hside.tolist(), n=len(columns)))
 
     m = env.m
@@ -142,47 +131,31 @@ def publish_static(circuit, env, policy, cfg):
             rear_blind_deg=float(max(0.0, 360.0 - 2.0 * rear)),
             acceptance_deg=float(eye_cfg.acceptance_angle),
         )
-    BUS.set_static(
-        "info",
-        dict(
-            dataset=circuit.cx.source,
-            neurons=int(circuit.n),
-            connections=int(circuit.cx.W.nnz),
-            synapses=int(circuit.cx.n_synapses),
-            displayed=int(len(idx)),
-            trainable=int(policy.n_trainable()),
-            arch=cfg.arch,
-            scale=cfg.scale,
-            n_gates=int(env.cfg.n_gates),
-            recurrent=bool(cfg.recurrent),
-            tbptt_steps=int(cfg.tbptt_steps),
-            control_hz=float(env.cfg.control_hz),
-            state_carry=float(cfg.state_carry),
-            eye_fov=eye_fov,
-            morphology=dict(
-                wing_length=float(m.wing_length),
-                mean_chord=float(m.mean_chord),
-                hinge_offset=m.hinge_offset.tolist(),
-                stroke_plane_angle=float(m.stroke_plane_angle),
-                body_length=2.4e-3,
-                body_radius=0.55e-3,
-            ),
-            afferent={k: int(len(v)) for k, v in circuit.afferent.items()},
-            efferent={k: int(len(v)) for k, v in circuit.efferent.items()},
+    BUS.set_static("info", dict(
+        dataset=circuit.cx.source,
+        neurons=int(circuit.n), connections=int(circuit.cx.W.nnz),
+        synapses=int(circuit.cx.n_synapses), displayed=int(len(idx)),
+        trainable=int(policy.n_trainable()), arch=cfg.arch, scale=cfg.scale,
+        n_gates=int(env.cfg.n_gates), policy_mode="stateless",
+        propagation_iters=int(cfg.n_iters), control_hz=float(env.cfg.control_hz),
+        eye_fov=eye_fov,
+        morphology=dict(
+            wing_length=float(m.wing_length), mean_chord=float(m.mean_chord),
+            hinge_offset=m.hinge_offset.tolist(), stroke_plane_angle=float(m.stroke_plane_angle),
+            body_length=2.4e-3, body_radius=0.55e-3,
         ),
-    )
+        afferent={k: int(len(v)) for k, v in circuit.afferent.items()},
+        efferent={k: int(len(v)) for k, v in circuit.efferent.items()},
+    ))
 
 
 def _episode_reset(info: dict, pos: np.ndarray) -> bool:
-    """Detect the autoreset that already happened inside env.step()."""
     global _LAST_POS
     reset = False
     for key in ("crashed", "finished"):
         value = info.get(key)
         if value is not None and len(value) and bool(value[0]):
             reset = True
-    # Time-limit resets do not have a dedicated flag in info. A jump back to the
-    # course start is unambiguous at this scale and catches that case too.
     if _LAST_POS is not None and np.linalg.norm(pos - _LAST_POS) > 0.12:
         reset = True
     _LAST_POS = pos.copy()
@@ -190,11 +163,9 @@ def _episode_reset(info: dict, pos: np.ndarray) -> bool:
 
 
 def publish_frame(env, policy, circuit, state: torch.Tensor, info: dict):
-    """Publish one monitor sample without making the dashboard do redundant work."""
     global _TRAIL
     idx = display_index(circuit)
 
-    h = None
     if state.ndim == 2 and state.numel():
         h = state[:, 0].detach().cpu().numpy()
         activity = h[idx]
@@ -208,14 +179,11 @@ def publish_frame(env, policy, circuit, state: torch.Tensor, info: dict):
         )
 
     snap = env.snapshot(0)
-    # Luminance is sent once in the compact eye_frame channel below; do not
-    # duplicate the full column vector inside the flight payload.
     snap.pop("luminance", None)
     ws = env.wpg.kinematics()
     snap["wing"].update(
         stroke_tilt=float(ws.stroke_tilt[0]),
-        head=ws.head[0].tolist(),
-        abdomen=float(ws.abdomen[0]),
+        head=ws.head[0].tolist(), abdomen=float(ws.abdomen[0]),
     )
 
     pos = np.asarray(snap["pos"], dtype=np.float64)
@@ -230,9 +198,6 @@ def publish_frame(env, policy, circuit, state: torch.Tensor, info: dict):
 
     channels = {"flight": snap}
     if env.n_columns:
-        # The dashboard is an observer, not another preprocessing stage. Only
-        # show the raw luminance actually rendered at each ommatidium; ON/OFF
-        # channels remain part of the policy input but are not visualized.
         channels["eye_frame"] = dict(lum=_quant(env.last_lum[0]))
     channels["live"] = dict(
         speed=float(info["speed"][0]) if "speed" in info else 0.0,
