@@ -28,10 +28,10 @@ class TrainConfig:
     max_grad_norm: float = 0.75
     target_kl: float = 0.03
 
-    # connectome policy
-    n_iters: int = 4
-    learn_synapses: bool = False
-    warmstart_steps: int = 400
+    # connectome policy: topology is fixed, allowed edge weights are learned.
+    n_iters: int = 6
+    learn_synapses: bool = True
+    warmstart_steps: int = 800
 
     # architecture / task
     arch: str = "connectome"  # connectome | shuffled | erdos | mlp
@@ -104,8 +104,8 @@ class TrainConfig:
         if not isinstance(data, dict):
             raise TypeError("training config must be a mapping")
         data = dict(data)
-        # Legacy recurrent configs/checkpoints remain loadable; temporal-state
-        # controls are intentionally ignored by the stateless policy.
+        # Legacy recurrent configs/checkpoints remain parseable; temporal-state
+        # controls are intentionally ignored by the feed-forward policy.
         for legacy in ("monitor_every", "recurrent", "tbptt_steps", "state_carry"):
             data.pop(legacy, None)
         known = {f.name for f in fields(cls)}

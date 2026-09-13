@@ -1,4 +1,4 @@
-# Long unattended connectome-policy run for a 16 GB Apple-silicon laptop.
+# Long unattended connectome-mask run for a 16 GB Apple-silicon laptop.
 # 100M transitions is intentionally beyond a normal overnight run: stop it in
 # the morning with Ctrl-C and the trainer checkpoints before exiting.
 
@@ -16,10 +16,12 @@ ent_coef: 0.004
 max_grad_norm: 0.75
 target_kl: 0.03
 
-# Four sparse message-passing rounds per independent control decision.
-n_iters: 4
-learn_synapses: false
-warmstart_steps: 400
+# Six feed-forward sparse residual layers. Every measured connectome edge is an
+# allowed trainable weight; absent edges stay zero.
+n_iters: 6
+learn_synapses: true
+# 800 vector steps x 16 envs = 12,800 expert transitions before PPO.
+warmstart_steps: 800
 
 arch: connectome
 scale: flight
