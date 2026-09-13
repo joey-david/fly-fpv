@@ -19,6 +19,8 @@ import torch.nn.functional as F
 
 from ..connectome.circuits import FlightCircuit
 
+WING_MOTOR_GROUPS = ("power", "basalar", "axillary", "hinge", "pterale", "wing_misc")
+
 
 @dataclass
 class PolicyConfig:
@@ -69,7 +71,6 @@ class ConnectomePolicy(nn.Module):
         self.action_dim = action_dim
         self.phi = _act(self.cfg.act)
 
-        # ---------------------------------------------------------------- mask
         # W[post, pre]. Only row/column coordinates survive: measured magnitudes
         # and neurotransmitter signs are not part of the optimization constraint.
         coo = circuit.cx.W.tocoo()
@@ -80,9 +81,8 @@ class ConnectomePolicy(nn.Module):
         self.register_buffer("edge_index", edge_index)
         self.n_edges = len(rows)
 
-        # Fan-in-scaled random initialization is conventional NN initialization,
-        # but evaluated only on the connectome's allowed edges. Each unrolled
-        # layer gets its own values: topology is shared, weights are not.
+        # Fan-in-scaled random initialization, evaluated only on allowed edges.
+        # Each unrolled layer gets independent values; topology is shared.
         indegree = np.bincount(rows, minlength=self.N).astype(np.float32)
         edge_std = self.cfg.edge_init_scale / np.sqrt(np.maximum(indegree[rows], 1.0))
         init = torch.randn(self.cfg.n_iters, self.n_edges)
@@ -93,17 +93,13 @@ class ConnectomePolicy(nn.Module):
             self.register_buffer("edge_weight", init)
 
         self.node_bias = nn.Parameter(torch.zeros(self.cfg.n_iters, self.N))
-        # Residual coefficient in (0, 1), initialized to 0.5. The normalized
-        # residual keeps six sparse layers numerically tame without layernorming
-        # across biologically unrelated neurons.
         self.residual_logit = nn.Parameter(torch.zeros(self.cfg.n_iters))
 
-        # --------------------------------------------------------------- inputs
+        # Vision keeps only the useful anatomical constraint: retinotopy.
         self.retina_rows = torch.from_numpy(
             circuit.afferent.get("retina", np.array([], dtype=np.int64))
         )
         self.register_buffer("_ret", self.retina_rows)
-
         cols_meta = sorted({v for v in circuit.hex_coords.values()})
         col_ix = {c: i for i, c in enumerate(cols_meta)}
         ret_col = []
@@ -113,12 +109,13 @@ class ConnectomePolicy(nn.Module):
         self.register_buffer("ret_col", torch.tensor(ret_col, dtype=torch.long))
         self.n_columns = len(cols_meta)
 
-        # Each retinotopic neuron learns its own mixture of the local ON/OFF
-        # channels. Retinotopy is fixed; ON/OFF cell-type semantics are not.
+        # Each retinotopic neuron learns its own mixture of local ON/OFF.
         self.retina_mix = nn.Parameter(torch.empty(len(self.retina_rows), 2))
         nn.init.normal_(self.retina_mix, std=1.0 / math.sqrt(2.0))
         self.retina_bias = nn.Parameter(torch.zeros(len(self.retina_rows)))
 
+        # All other task/proprio features get a learned adapter into the
+        # non-retinal sensory population. We do not impose modality semantics.
         other = [v for k, v in circuit.afferent.items() if k != "retina" and len(v)]
         other_rows = np.unique(np.concatenate(other)) if other else np.array([], dtype=np.int64)
         self.register_buffer("_oth", torch.from_numpy(other_rows))
@@ -133,18 +130,33 @@ class ConnectomePolicy(nn.Module):
         else:
             self.sensory_encoder = None
 
-        # -------------------------------------------------------------- outputs
+        # Outputs are anatomically anchored, but not hand-wired. Wing controls
+        # can use any flight motor neuron; head and abdomen use their own motor
+        # populations. Within those families the readout is fully learned.
         motor_rows = circuit.efferent_idx
         if not len(motor_rows):
             raise ValueError("connectome policy requires at least one efferent neuron")
         self.register_buffer("motor_rows", torch.from_numpy(motor_rows))
-        self.motor_readout = nn.Linear(len(motor_rows), action_dim)
-        nn.init.normal_(self.motor_readout.weight, std=0.02)
-        nn.init.zeros_(self.motor_readout.bias)
 
-        # The critic is deliberately unconstrained: it is a training aid, not
-        # part of the deployed actor. It sees task state plus the same motor
-        # population from which the actor must produce its controls.
+        wing_parts = [circuit.efferent.get(k, np.array([], dtype=np.int64))
+                      for k in WING_MOTOR_GROUPS]
+        wing_rows = np.unique(np.concatenate([x for x in wing_parts if len(x)]))
+        head_rows = np.unique(circuit.efferent.get("neck", np.array([], dtype=np.int64)))
+        abdomen_rows = np.unique(circuit.efferent.get("abdomen", np.array([], dtype=np.int64)))
+        if not len(wing_rows):
+            raise ValueError("connectome policy requires flight motor neurons")
+        self.register_buffer("wing_motor_rows", torch.from_numpy(wing_rows))
+        self.register_buffer("head_motor_rows", torch.from_numpy(head_rows))
+        self.register_buffer("abdomen_motor_rows", torch.from_numpy(abdomen_rows))
+
+        self.wing_readout = nn.Linear(len(wing_rows), min(action_dim, 12))
+        self.head_readout = nn.Linear(max(len(head_rows), 1), 2)
+        self.abdomen_readout = nn.Linear(max(len(abdomen_rows), 1), 1)
+        for readout in (self.wing_readout, self.head_readout, self.abdomen_readout):
+            nn.init.normal_(readout.weight, std=0.02)
+            nn.init.zeros_(readout.bias)
+
+        # The critic is a training aid, so it is intentionally unconstrained.
         self.value = nn.Sequential(
             nn.Linear(proprio_dim + len(motor_rows), self.cfg.value_hidden), nn.SiLU(),
             nn.Linear(self.cfg.value_hidden, self.cfg.value_hidden), nn.SiLU(),
@@ -202,7 +214,21 @@ class ConnectomePolicy(nn.Module):
             h = (h + a * self.phi(z)) / torch.sqrt(1.0 + a * a)
 
         motor = h.index_select(0, self.motor_rows).T
-        mean = self.motor_readout(motor)
+        wing = h.index_select(0, self.wing_motor_rows).T
+        parts = [self.wing_readout(wing)]
+        if self.action_dim > 12:
+            if len(self.head_motor_rows):
+                head = h.index_select(0, self.head_motor_rows).T
+            else:
+                head = torch.zeros(wing.shape[0], 1, device=h.device, dtype=h.dtype)
+            parts.append(self.head_readout(head))
+        if self.action_dim > 14:
+            if len(self.abdomen_motor_rows):
+                abdomen = h.index_select(0, self.abdomen_motor_rows).T
+            else:
+                abdomen = torch.zeros(wing.shape[0], 1, device=h.device, dtype=h.dtype)
+            parts.append(self.abdomen_readout(abdomen))
+        mean = torch.cat(parts, -1)[..., :self.action_dim]
         value = self.value(torch.cat([proprio, motor], -1)).squeeze(-1)
         return mean, self.log_std.expand_as(mean), value, h
 
