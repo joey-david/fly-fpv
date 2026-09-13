@@ -17,14 +17,7 @@ def _degree_preserving_rewire(
     rng: np.random.Generator,
     swaps_per_edge: float = 2.0,
 ) -> sp.csr_matrix:
-    """Directed double-edge swaps preserving in/out degree and outgoing weights.
-
-    For edges (post1 <- pre1) and (post2 <- pre2), swap the postsynaptic
-    targets while leaving each presynaptic edge weight attached to its source.
-    This preserves every neuron's in-degree and out-degree exactly, preserves
-    each presynaptic neuron's outgoing weight/sign multiset (Dale's law), and
-    rejects duplicate edges and newly introduced self-loops.
-    """
+    """Directed double-edge swaps preserving every node's in/out degree."""
     coo = W.tocoo(copy=True)
     rows = coo.row.astype(np.int64, copy=True)
     cols = coo.col.astype(np.int64, copy=True)
@@ -95,7 +88,7 @@ def shuffle_connectome(
     mode: str = "degree",
     seed: int = 0,
 ) -> FlightCircuit:
-    """Return a copy of the circuit with only its connectivity control changed."""
+    """Return a copy of the circuit with only its adjacency control changed."""
     rng = np.random.default_rng(seed)
     W = circuit.cx.W.tocsr()
     if mode == "degree":
@@ -112,10 +105,11 @@ def shuffle_connectome(
 
 
 class MLPPolicy(nn.Module):
-    """Feed-forward baseline over the same observations and action distribution.
+    """Dense feed-forward control with a similar parameter budget.
 
-    The defaults are chosen to land close to the ~355k trainable-parameter
-    budget of the flight-scale connectome policy when vision is enabled.
+    A six-layer flight connectome has roughly 3--4M trainable parameters. The
+    1280-wide default keeps the dense baseline in that regime so topology
+    comparisons are not just capacity comparisons.
     """
 
     def __init__(
@@ -123,7 +117,7 @@ class MLPPolicy(nn.Module):
         proprio_dim: int,
         vision_dim: int,
         action_dim: int,
-        hidden: int = 336,
+        hidden: int = 1280,
         depth: int = 3,
         vision_compress: int = 32,
         log_std_init: float = -1.6,
